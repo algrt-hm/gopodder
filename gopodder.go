@@ -30,6 +30,10 @@ import (
 	strip "github.com/grokify/html-strip-tags-go"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mmcdole/gofeed"
+
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Set here as assume this will be fine for most cases
@@ -76,6 +80,13 @@ func print_a_few(slice_of_str []string) {
 			break
 		}
 	}
+}
+
+func removeAccents(s string) string {
+	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	result, _, err := transform.String(t, s)
+	check(err)
+	return result
 }
 
 // Approach to remove unicode characters; this is because id2v3 < 2.4
@@ -171,8 +182,11 @@ func CleanText(text string, maxLength int) string {
 		return text[0:maxLength-3] + "..."
 	}
 
-	// Finally remove any emojis (this is my own addition to the gist mentioned at the top in the comment)
-	return gomoji.RemoveEmojis(text)
+	// Remove any emojis (this is my own addition to the gist mentioned at the top in the comment)
+	text_sans_emojis := gomoji.RemoveEmojis(text)
+
+	// Finally get rid of any accents etc
+	return removeAccents(text_sans_emojis)
 }
 
 // Below two functions from https://stackoverflow.com/a/59293875
