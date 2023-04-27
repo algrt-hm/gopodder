@@ -50,27 +50,29 @@ var cwd string           // Current working directory
 // M is an alias for map[string]interface{}
 type M map[string]interface{}
 
-// Utility function to convert a string to NullString if empty
+// nullWrap is a utility function to convert a string to NullString if empty
 // Lifted from: https://stackoverflow.com/questions/40266633/golang-insert-null-into-sql-instead-of-empty-string
-func null_wrap(s string) sql.NullString {
+func nullWrap(s string) sql.NullString {
 	if len(strings.TrimSpace(s)) == 0 {
 		return sql.NullString{}
 	}
+	// implied else
 	return sql.NullString{
 		String: s,
 		Valid:  true,
 	}
 }
 
-// Utility function to check err and also give line number of the calling function
-func check(e error) {
-	if e != nil {
+// checkErr is a utility function to checkErr err and also give line number of the calling function
+func checkErr(err error) {
+	if err != nil {
 		_, _, line, _ := runtime.Caller(1)
-		l.Fatalf("%s (called from: %d)", e, line)
+		l.Fatalf("%s (called from: %d)", err, line)
 	}
 }
 
-func print_a_few(slice_of_str []string) {
+// printSome is a utility function to print a few items from a slice
+func printSome(slice_of_str []string) {
 	counter := 0
 	for _, str := range slice_of_str {
 		fmt.Println(str)
@@ -82,17 +84,19 @@ func print_a_few(slice_of_str []string) {
 	}
 }
 
+// removeAccents removes accents from a string
+// Lifted from: https://stackoverflow.com/a/65981868
 func removeAccents(s string) string {
 	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
 	result, _, err := transform.String(t, s)
-	check(err)
+	checkErr(err)
 	return result
 }
 
-// Approach to remove unicode characters; this is because id2v3 < 2.4
+// cleanText removes/sorts unicode characters; this is because id2v3 < 2.4
 // does not support unicode
 // Lifted from: https://gist.github.com/jheth/1e74039003c52cb46a16e9eb799846a4
-func CleanText(text string, maxLength int) string {
+func cleanText(text string, maxLength int) string {
 	if len(text) < 5 {
 		return ""
 	}
@@ -183,16 +187,15 @@ func CleanText(text string, maxLength int) string {
 	}
 
 	// Remove any emojis (this is my own addition to the gist mentioned at the top in the comment)
-	text_sans_emojis := gomoji.RemoveEmojis(text)
-
-	// Finally get rid of any accents etc
-	return removeAccents(text_sans_emojis)
+	// and then get rid of any accents finally
+	return removeAccents(gomoji.RemoveEmojis(text))
 }
 
+// isUpper is a utility function to check if a string is all upper-case
 // Below two functions from https://stackoverflow.com/a/59293875
 // Strange that not already in standard library, but maybe I missed it ...
 // Returns true if all runes in string are upper-case letters
-func IsUpper(s string) bool {
+func isUpper(s string) bool {
 	for _, r := range s {
 		if !unicode.IsUpper(r) && unicode.IsLetter(r) {
 			return false
@@ -201,25 +204,15 @@ func IsUpper(s string) bool {
 	return true
 }
 
-// Returns true if all runes in string are lower-case letters
-func IsLower(s string) bool {
-	for _, r := range s {
-		if !unicode.IsLower(r) && unicode.IsLetter(r) {
-			return false
-		}
-	}
-	return true
-}
-
-// Utility function to return current working directory
-func getcwd() string {
+// getCwd is a utility function to return current working directory
+func getCwd() string {
 	ex, err := os.Executable()
-	check(err)
+	checkErr(err)
 	return filepath.Dir(ex)
 }
 
-// Creates our SQLite db and tables if they do not exist
-func create_tables_if_not_exist() {
+// createTablesIfNotExist creates our SQLite db and tables if they do not exist
+func createTablesIfNotExist() {
 	create_podcasts := `
 	CREATE TABLE IF NOT EXISTS podcasts (
 		-- no idx needed as sqllite provides rowid
@@ -266,35 +259,35 @@ func create_tables_if_not_exist() {
 	`
 
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 
 	if err == nil {
 		defer db.Close()
 
 		statement, err := db.Prepare(create_podcasts)
-		check(err)
+		checkErr(err)
 		_, err = statement.Exec()
-		check(err)
+		checkErr(err)
 
 		statement, err = db.Prepare(create_episodes)
-		check(err)
+		checkErr(err)
 		_, err = statement.Exec()
-		check(err)
+		checkErr(err)
 
 		statement, err = db.Prepare(create_episodes)
-		check(err)
+		checkErr(err)
 		_, err = statement.Exec()
-		check(err)
+		checkErr(err)
 
 		statement, err = db.Prepare(create_downloaded)
-		check(err)
+		checkErr(err)
 		_, err = statement.Exec()
-		check(err)
+		checkErr(err)
 	}
 }
 
-// Add the podcast metadata to the db
-func pod_episodes_into_db(pod map[string]string, episodes []M) {
+// podEpisodesIntoDatabase adds the podcast metadata to the db
+func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 
 	// For the podcast
 	// 1. Is it in the db?
@@ -302,7 +295,7 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 	//   If no then add it to the db
 
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 	if err == nil {
 		defer db.Close()
 	}
@@ -313,12 +306,12 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 		FROM podcasts
 		WHERE podcasts.title=?
 		;`, pod["title"])
-	check(err)
+	checkErr(err)
 
 	var count int
 	for rows.Next() {
 		err = rows.Scan(&count)
-		check(err)
+		checkErr(err)
 	}
 
 	if count > 1 {
@@ -336,13 +329,13 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 			SET last_seen = ?
 			WHERE title = ?
 			;`)
-		check(err)
+		checkErr(err)
 
 		res, err := stmt.Exec(ts, pod["title"])
-		check(err)
+		checkErr(err)
 
 		affected, err := res.RowsAffected()
-		check(err)
+		checkErr(err)
 
 		if verbose {
 			l.Println(affected, "rows updated (last_seen)")
@@ -359,23 +352,23 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 			VALUES
 			(?, ?, ?, ?, ?, ?, ?, ?)
 			;`)
-		check(err)
+		checkErr(err)
 
 		// We wrap these because we don't want empty strings in the db ideally
 		res, err := stmt.Exec(
-			null_wrap(pod["author"]),
-			null_wrap(pod["category"]),
-			null_wrap(pod["description"]),
-			null_wrap(pod["language"]),
-			null_wrap(pod["link"]),
-			null_wrap(pod["title"]),
+			nullWrap(pod["author"]),
+			nullWrap(pod["category"]),
+			nullWrap(pod["description"]),
+			nullWrap(pod["language"]),
+			nullWrap(pod["link"]),
+			nullWrap(pod["title"]),
 			ts,
 			ts,
 		)
-		check(err)
+		checkErr(err)
 
 		idx, err := res.LastInsertId()
-		check(err)
+		checkErr(err)
 		if verbose {
 			l.Println("insert id for podcast", pod["title"], "is", idx)
 		}
@@ -404,12 +397,12 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 			FROM episodes
 			WHERE podcastname_episodename_hash=?
 			;`, podcastname_episodename_hash)
-		check(err)
+		checkErr(err)
 
 		var count int
 		for rows.Next() {
 			err = rows.Scan(&count)
-			check(err)
+			checkErr(err)
 		}
 
 		if count > 1 {
@@ -426,13 +419,13 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 				SET last_seen = ?
 				WHERE title = ?
 				;`)
-			check(err)
+			checkErr(err)
 
 			res, err := stmt.Exec(ts, ep["title"])
-			check(err)
+			checkErr(err)
 
 			affected, err := res.RowsAffected()
-			check(err)
+			checkErr(err)
 
 			if verbose {
 				l.Println(affected, "rows updated (last_seen)")
@@ -454,7 +447,7 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 					?, ?, ?,
 					?, ?, ?
 				);`)
-			check(err)
+			checkErr(err)
 
 			// Make sure descption does not contain HTML
 			non_html_desc := strip.StripTags(ep["description"])
@@ -466,24 +459,24 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 			}
 
 			res, err := stmt.Exec(
-				null_wrap(ep["author"]),
-				null_wrap(ep["description"]),
-				null_wrap(ep["episode"]),
-				null_wrap(ep["file"]),
-				null_wrap(ep["format"]),
-				null_wrap(ep["guid"]),
-				null_wrap(ep["link"]),
-				null_wrap(ep["published"]),
-				null_wrap(ep["title"]),
-				null_wrap(ep["updated"]),
+				nullWrap(ep["author"]),
+				nullWrap(ep["description"]),
+				nullWrap(ep["episode"]),
+				nullWrap(ep["file"]),
+				nullWrap(ep["format"]),
+				nullWrap(ep["guid"]),
+				nullWrap(ep["link"]),
+				nullWrap(ep["published"]),
+				nullWrap(ep["title"]),
+				nullWrap(ep["updated"]),
 				ts, ts,
-				null_wrap(pod["title"]),
+				nullWrap(pod["title"]),
 				podcastname_episodename_hash, file_url_hash,
 			)
-			check(err)
+			checkErr(err)
 
 			idx, err := res.LastInsertId()
-			check(err)
+			checkErr(err)
 			if verbose {
 				l.Println("insert id for episode", ep["title"], "is", idx)
 			}
@@ -491,8 +484,8 @@ func pod_episodes_into_db(pod map[string]string, episodes []M) {
 	}
 }
 
-// Read configuration file and return slices with URLs for RSS files
-func read_config(conf_file_path string) ([]string, error) {
+// readConfig is a function which reads the configuration file and return slices with URLs for RSS files
+func readConfig(conf_file_path string) ([]string, error) {
 	content, err := ioutil.ReadFile(conf_file_path)
 	validated := []string{}
 
@@ -521,8 +514,8 @@ func read_config(conf_file_path string) ([]string, error) {
 	return validated, nil
 }
 
-// Parse an individual RSS feed
-func parse_feed(url string) (map[string]string, []M, error) {
+// parseFeed a function to to parse an individual RSS feed
+func parseFeed(url string) (map[string]string, []M, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -670,9 +663,9 @@ func parse_feed(url string) (map[string]string, []M, error) {
 	return pod, s_items, err
 }
 
-// Returns the hash part from the filename
+// hashFromFilename returns the hash part from the filename
 // we can then compare this hash to what is in the db
-func hash_from_filename(filename string) (string, string) {
+func hashFromFilename(filename string) (string, string) {
 	parsed_a := strings.ReplaceAll(filename, ".", "-")
 	parsed_b := strings.Split(parsed_a, "-")
 	n_parsed_b := len(parsed_b)
@@ -681,13 +674,13 @@ func hash_from_filename(filename string) (string, string) {
 	return hash, transformed_title
 }
 
-// Returns a set of filenames that we identify as podcasts
+// sensibleFilesInDir returns a set of filenames that we identify as podcasts
 // Assumes .mp3 only
-func sensible_files_in_dir(path string) mapset.Set {
+func sensibleFilesInDir(path string) mapset.Set {
 	filenames_set := mapset.NewSet()
 
 	files, err := os.ReadDir(path)
-	check(err)
+	checkErr(err)
 
 	// Put all the filenames into a set
 	for _, file := range files {
@@ -703,8 +696,8 @@ func sensible_files_in_dir(path string) mapset.Set {
 	return filenames_set
 }
 
-// Check the db against files we already have
-func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
+// seeWhatPodsWeAlreadyHave will check the db against files we already have
+func seeWhatPodsWeAlreadyHave(db_file string, path string) mapset.Set {
 	filenames_hash_set := mapset.NewSet()
 	db_hash_set := mapset.NewSet()
 	transformed_titles_set := mapset.NewSet()
@@ -715,7 +708,7 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 	tts_in_filesname := mapset.NewSet()
 
 	files, err := os.ReadDir(path)
-	check(err)
+	checkErr(err)
 
 	// Put all the filenames into a set
 	for _, file := range files {
@@ -723,7 +716,7 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 		if filename[:2] != "._" {
 			// Count the number of '-' occurances betcause if not 5 and with mp3 then not a well formed filename
 			if strings.Count(filename, "-") == 5 && strings.Contains(filename, "mp3") {
-				hash, transformed_title := hash_from_filename(filename)
+				hash, transformed_title := hashFromFilename(filename)
 				filenames_hash_set.Add(hash)
 				filenames_set.Add(filename)
 
@@ -737,7 +730,7 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 
 	// Get all the file_url_hashes from the db too and put them into another set
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 
 	if err == nil {
 		defer db.Close()
@@ -746,7 +739,7 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 	query := `SELECT podcast_title, title, file_url_hash FROM episodes WHERE file IS NOT NULL AND file !='';`
 
 	rows, err := db.Query(query)
-	check(err)
+	checkErr(err)
 
 	// Iterate over the rows in the result
 	for rows.Next() {
@@ -754,10 +747,10 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 		var podcast_title, title, file_url_hash, transformed_title string
 
 		err = rows.Scan(&podcast_title, &title, &file_url_hash)
-		check(err)
+		checkErr(err)
 
 		// sets and maps
-		transformed_title = title_transformation(title)
+		transformed_title = titleTransformation(title)
 		transformed_titles_set.Add(transformed_title)
 		transformed_titles_to_hashes[transformed_title] = file_url_hash
 		hashes_to_transformed_titles[file_url_hash] = transformed_title
@@ -867,9 +860,9 @@ func see_what_pods_we_already_have(db_file string, path string) mapset.Set {
 	return in_db_not_in_file_set
 }
 
-// Takes a podcast title and transforms it (removing spaces etc)
+// titleTransformation takes a podcast title and transforms it (removing spaces etc)
 // so it can sensibly be used in the podcast filename
-func title_transformation(s string) string {
+func titleTransformation(s string) string {
 	// Get rid of any quotation characters
 	var s_c string
 	s_a := strings.ReplaceAll(s, "\"", "")
@@ -892,7 +885,7 @@ func title_transformation(s string) string {
 	for _, v := range str_slice {
 		s := v[0]
 		// If the word is all upper case make it title case
-		if IsUpper(s) {
+		if isUpper(s) {
 			new_str = append(new_str, strings.Title(strings.ToLower(s)))
 		} else {
 			new_str = append(new_str, s)
@@ -902,15 +895,15 @@ func title_transformation(s string) string {
 	return strings.Join(new_str, "_")
 }
 
-// Generate our wget shell command give a URL and filename
-func gen_script_line(url string, filename string) string {
+// genScriptLine generate our wget shell command give a URL and filename
+func genScriptLine(url string, filename string) string {
 	cmd := "wget --no-clobber --continue --no-check-certificate --no-verbose"
 	return fmt.Sprintf("%s '%s' -O '%s' && chmod 666 '%s'", cmd, url, filename, filename)
 }
 
-// Generates download script based on the pods to download
-func generate_download_list(podcasts_dir string) {
-	hashes := see_what_pods_we_already_have(db_file, podcasts_dir)
+// generateDownloadList generates download script based on the pods to download
+func generateDownloadList(podcasts_dir string) {
+	hashes := seeWhatPodsWeAlreadyHave(db_file, podcasts_dir)
 
 	l.Println("Pods for download are")
 
@@ -922,14 +915,14 @@ func generate_download_list(podcasts_dir string) {
 	query := `SELECT podcast_title, IFNULL(published, first_seen), title, podcastname_episodename_hash, file_url_hash, file FROM episodes WHERE file != '' AND file IS NOT NULL;`
 
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 
 	if err == nil {
 		defer db.Close()
 	}
 
 	rows, err := db.Query(query)
-	check(err)
+	checkErr(err)
 
 	filenames := make([]string, 0)
 	urls := make([]string, 0)
@@ -938,12 +931,12 @@ func generate_download_list(podcasts_dir string) {
 		// Data from db
 		var podcast_title, published, title, podcastname_episodename_hash, file_url_hash, file string
 		err = rows.Scan(&podcast_title, &published, &title, &podcastname_episodename_hash, &file_url_hash, &file)
-		check(err)
+		checkErr(err)
 
 		// If file_url_hash in hashes ...
 		if hashes.Contains(file_url_hash) {
-			transformed_title := title_transformation(title)
-			transformed_podcast_title := title_transformation(podcast_title)
+			transformed_title := titleTransformation(title)
+			transformed_podcast_title := titleTransformation(podcast_title)
 			short_date_a := []rune(published)
 			short_date := string(short_date_a[:10])
 
@@ -955,7 +948,7 @@ func generate_download_list(podcasts_dir string) {
 	}
 
 	// some output to keep user informed
-	print_a_few(filenames)
+	printSome(filenames)
 
 	// for anything that's in filenames but not in download_hopper_filenames we should
 	// put in the script
@@ -963,7 +956,7 @@ func generate_download_list(podcasts_dir string) {
 	// slice of strings for the script lines
 	lines := make([]string, 0)
 	for i := range filenames {
-		lines = append(lines, gen_script_line(urls[i], filenames[i]))
+		lines = append(lines, genScriptLine(urls[i], filenames[i]))
 	}
 
 	if len(lines) == 0 {
@@ -972,7 +965,7 @@ func generate_download_list(podcasts_dir string) {
 		// if there is nothing to download
 	} else {
 		fmt.Println("Lines being added to script are ...")
-		print_a_few(lines)
+		printSome(lines)
 	}
 
 	// then we scan for the files and add those that went into the script to the download_hopper table
@@ -982,32 +975,34 @@ func generate_download_list(podcasts_dir string) {
 	lines_joined := strings.Join(lines, "\n")
 	// Potential addition: permissions should probably be narrower
 	err = ioutil.WriteFile(filename, []byte(lines_joined), 0666)
-	check(err)
+	checkErr(err)
 
 	l.Printf("Written script to %s", filename)
 }
 
-func run_eyed3(filename string) {
+// runEyed3 runs the eyeD3 command to strip tags from the mp3 file
+// TODO: path is FreeBSD specific
+func runEyed3(filename string) {
 	fmt.Println("Reading with eyeD3:")
 	cmd := exec.Command("/usr/local/bin/python3.9", "/usr/local/bin/eyeD3", filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
-	check(err)
+	checkErr(err)
 
 	fmt.Println("Removing tags with eyeD3:")
 	cmd = exec.Command("/usr/local/bin/python3.9", "/usr/local/bin/eyeD3", "--remove-all", filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
-	check(err)
+	checkErr(err)
 }
 
-// Run the download script with the wget commands to download the pods
-func run_download_script(podcasts_dir string) {
-	cwd := getcwd()
+// runDownloadScript run the download script with the wget commands to download the pods
+func runDownloadScript(podcasts_dir string) {
+	cwd := getCwd()
 	if cwd != podcasts_dir {
-		fmt.Printf("Note: current working dir is %s, which is where the podcasts will be saved into\n", getcwd())
+		fmt.Printf("Note: current working dir is %s, which is where the podcasts will be saved into\n", getCwd())
 		fmt.Printf("we assume the pod downloading script is in %s however\n", podcasts_dir)
 	}
 
@@ -1015,20 +1010,20 @@ func run_download_script(podcasts_dir string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
-	check(err)
+	checkErr(err)
 }
 
-// Updates the db to record the pods downloaded as downloaded
-func update_db_for_downloads() {
-	cwd := getcwd()
+// updateDatabaseForDownloads updates the db to record the pods downloaded as downloaded
+func updateDatabaseForDownloads() {
+	cwd := getCwd()
 	fmt.Printf("Note: updating db with downloaded files in %s\n", cwd)
 
 	// Get files
-	files := sensible_files_in_dir(cwd).ToSlice()
+	files := sensibleFilesInDir(cwd).ToSlice()
 
 	// Open db
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 	if err == nil {
 		defer db.Close()
 	}
@@ -1041,13 +1036,13 @@ func update_db_for_downloads() {
 			FROM downloads
 			WHERE filename = ?
 			;`, file)
-		check(err)
+		checkErr(err)
 
 		// If it is, update last_seen
 		var count int
 		for rows.Next() {
 			err = rows.Scan(&count)
-			check(err)
+			checkErr(err)
 		}
 
 		if count > 1 {
@@ -1061,13 +1056,13 @@ func update_db_for_downloads() {
 				SET last_seen = ?
 				WHERE filename = ?
 				;`)
-			check(err)
+			checkErr(err)
 
 			res, err := stmt.Exec(ts, file)
-			check(err)
+			checkErr(err)
 
 			affected, err := res.RowsAffected()
-			check(err)
+			checkErr(err)
 
 			if verbose {
 				l.Println(affected, "rows updated (last_seen)")
@@ -1079,7 +1074,7 @@ func update_db_for_downloads() {
 			l.Println(file, "is not in the db and seems to be a fresh download, adding")
 
 			// Get the hash from the filename
-			hash, _ := hash_from_filename(file.(string))
+			hash, _ := hashFromFilename(file.(string))
 
 			stmt, err := db.Prepare(`
 				INSERT INTO downloads
@@ -1087,14 +1082,14 @@ func update_db_for_downloads() {
 				VALUES
 				(?, ?, ?, ?)
 				;`)
-			check(err)
+			checkErr(err)
 
 			// We wrap these because we don't want empty strings in the db ideally
 			res, err := stmt.Exec(file, hash, ts, ts)
-			check(err)
+			checkErr(err)
 
 			idx, err := res.LastInsertId()
-			check(err)
+			checkErr(err)
 
 			if verbose {
 				l.Println("insert id for podcast download", file, "is", idx)
@@ -1105,8 +1100,8 @@ func update_db_for_downloads() {
 	// Could check to see if anything has unexpectedly disappeared but this seems pointless hence not done
 }
 
-// Tags the file at filename with the title and album metadata
-func tag_single_pod(filename string, title string, album string) {
+// tagSinglePod tags the file at filename with the title and album metadata
+func tagSinglePod(filename string, title string, album string) {
 	// title tag is title
 	// album is podcast_title
 	// genre is "Podcast"
@@ -1119,22 +1114,22 @@ func tag_single_pod(filename string, title string, album string) {
 	if err != nil {
 		fmt.Printf("%s is a file where reading the tags has been problematic %s\n", filename, err)
 		// fmt.Printf("You can try blitzing the tag data with: eyeD3 --remove-all %s", filename)
-		run_eyed3(filename)
+		runEyed3(filename)
 
 		// e.g.
 		// eyeD3 --remove-all Entitled_Opinions_about_Life_and_Literature-2021-12-03-The_Uses_of_Trauma_with_Alex_Rex-96de32981a4c34a2ca933854613183ee.mp3
 
 		parse = false
 		tag, err = id3v2.Open(filename, id3v2.Options{Parse: parse})
-		check(err)
+		checkErr(err)
 	} else {
 		defer tag.Close()
 	}
 
 	// If we get to here then we're writing
-	ascii_title := CleanText(title, len(title))
-	ascii_album := CleanText(album, len(album))
-	ascii_genre := CleanText(genre, len(genre))
+	ascii_title := cleanText(title, len(title))
+	ascii_album := cleanText(album, len(album))
+	ascii_genre := cleanText(genre, len(genre))
 
 	// Remove all existing frames
 	// particularly anything in comment and lyrics as there can be garbage in there (again Risky Talk podcast looking at you lol)
@@ -1173,12 +1168,12 @@ func tag_single_pod(filename string, title string, album string) {
 	if err != nil {
 		fmt.Println("Title:", ascii_title, "Album:", ascii_album, "Genre:", ascii_genre)
 	}
-	check(err)
+	checkErr(err)
 }
 
-// Tag all the podcasts
-func tag_those_pods(podcasts_dir string) int {
-	fmt.Printf("Note: will tag pods in current working directory %s\n", getcwd())
+// tagThosePods tag all the podcasts
+func tagThosePods(podcasts_dir string) int {
+	fmt.Printf("Note: will tag pods in current working directory %s\n", getCwd())
 	// fmt.Println("If the count is 0 make sure you ran -u after downloading")
 
 	filenames_set := mapset.NewSet()
@@ -1198,20 +1193,20 @@ func tag_those_pods(podcasts_dir string) int {
 	`
 	// Open db
 	db, err := sql.Open("sqlite3", db_file)
-	check(err)
+	checkErr(err)
 	if err == nil {
 		defer db.Close()
 	}
 
 	rows, err := db.Query(query)
-	check(err)
+	checkErr(err)
 
 	// If it is, update last_seen
 	var count int = 0
 	for rows.Next() {
 		var ns_filename, ns_podcast_title, ns_title, ns_description sql.NullString
 		err = rows.Scan(&ns_filename, &ns_podcast_title, &ns_title, &ns_description)
-		check(err)
+		checkErr(err)
 
 		filename := ns_filename.String
 		podcast_title := ns_podcast_title.String
@@ -1219,7 +1214,7 @@ func tag_those_pods(podcasts_dir string) int {
 		l.Printf("%s: %s / %s", filename, podcast_title, title)
 
 		// Tag 'em
-		tag_single_pod(filename, title, podcast_title)
+		tagSinglePod(filename, title, podcast_title)
 		count += 1
 		// Set of filenames we need to update in the db
 		filenames_set.Add(ns_filename)
@@ -1236,13 +1231,13 @@ func tag_those_pods(podcasts_dir string) int {
 				UPDATE downloads SET tagged_at = ?
 				WHERE filename = ?
 				;`)
-			check(err)
+			checkErr(err)
 
 			res, err := stmt.Exec(ts, ind_filename)
-			check(err)
+			checkErr(err)
 
 			affected, err := res.RowsAffected()
-			check(err)
+			checkErr(err)
 
 			if affected != 1 {
 				l.Fatal("More than one row affected which should not happen")
@@ -1258,16 +1253,16 @@ func tag_those_pods(podcasts_dir string) int {
 	return count
 }
 
-// Parse each of the feeds in the config file
-func parse_em(conf_file_path string) {
-	urls, err := read_config(conf_file_path + "/gopodder.conf")
-	check(err)
+// parseThem parse each of the feeds in the config file
+func parseThem(conf_file_path string) {
+	urls, err := readConfig(conf_file_path + "/gopodder.conf")
+	checkErr(err)
 
 	for _, url := range urls {
-		podcast, episodes, err := parse_feed(url)
-		check(err)
+		podcast, episodes, err := parseFeed(url)
+		checkErr(err)
 
-		pod_episodes_into_db(podcast, episodes)
+		podEpisodesIntoDatabase(podcast, episodes)
 	}
 }
 
@@ -1281,12 +1276,14 @@ func init() {
 	ts = time.Now().Format(time.RFC3339)
 
 	// defaults for conf file and podcast dir
-	cwd = getcwd()
+	cwd = getCwd()
 	conf_file_path_default = cwd
 	podcasts_dir_default = cwd
 }
 
-func cwd_check(cwd string) {
+// getCwd stops me from running this in my gopodder repo
+// TODO: this doesn't generalise
+func cwdCheck(cwd string) {
 	if cwd == "/home/mike/repos/gopodder" || cwd == "/usr/home/mike/repos/gopodder" {
 		fmt.Println("Quiting as cwd=", cwd)
 		os.Exit(1)
@@ -1378,39 +1375,39 @@ Note:
 		l.Printf(tmp_fmt, path_var_envname, podcasts_dir)
 	}
 
-	cwd := getcwd()
+	cwd := getCwd()
 	if *do_all || *download_pods {
 		// If we are downloading we make sure we are not downloading into home or similar
-		cwd_check(cwd)
+		cwdCheck(cwd)
 	}
 	// First let's get the tables ready to go and create them if not
-	create_tables_if_not_exist()
+	createTablesIfNotExist()
 
 	if *do_all {
-		parse_em(conf_file_path)
-		generate_download_list(podcasts_dir)
-		run_download_script(podcasts_dir)
-		update_db_for_downloads()
-		tag_those_pods(podcasts_dir)
+		parseThem(conf_file_path)
+		generateDownloadList(podcasts_dir)
+		runDownloadScript(podcasts_dir)
+		updateDatabaseForDownloads()
+		tagThosePods(podcasts_dir)
 	} else {
 		if *parse_opt_ptr {
-			parse_em(conf_file_path)
+			parseThem(conf_file_path)
 		}
 
 		if *see_opt_ptr {
-			generate_download_list(podcasts_dir)
+			generateDownloadList(podcasts_dir)
 		}
 
 		if *download_pods {
-			run_download_script(podcasts_dir)
+			runDownloadScript(podcasts_dir)
 		}
 
 		if *post_dl_update {
-			update_db_for_downloads()
+			updateDatabaseForDownloads()
 		}
 
 		if *tag_pods {
-			tag_those_pods(podcasts_dir)
+			tagThosePods(podcasts_dir)
 		}
 
 		if *experimental_opt {
