@@ -1,3 +1,4 @@
+////
 // gopodder
 //
 // To build:
@@ -9,11 +10,13 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,13 +34,15 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mmcdole/gofeed"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
 
 // Set here as assume this will be fine for most cases
-var db_file string = "gopodder.sqlite"
+var dbFile string = "gopodder.sqlite"
 
 // These globals will be set in init()
 var l *log.Logger // Logger
@@ -72,9 +77,9 @@ func checkErr(err error) {
 }
 
 // printSome is a utility function to print a few items from a slice
-func printSome(slice_of_str []string) {
+func printSome(sliceOfStr []string) {
 	counter := 0
-	for _, str := range slice_of_str {
+	for _, str := range sliceOfStr {
 		fmt.Println(str)
 		counter += 1
 		if counter > 3 {
@@ -213,7 +218,7 @@ func getCwd() string {
 
 // createTablesIfNotExist creates our SQLite db and tables if they do not exist
 func createTablesIfNotExist() {
-	create_podcasts := `
+	createPodcasts := `
 	CREATE TABLE IF NOT EXISTS podcasts (
 		-- no idx needed as sqllite provides rowid
 		title TEXT PRIMARY KEY,
@@ -227,7 +232,7 @@ func createTablesIfNotExist() {
 	);
 	`
 
-	create_episodes := `
+	createEpisodes := `
 	CREATE TABLE IF NOT EXISTS episodes (
 		author TEXT,
 		description TEXT,
@@ -248,7 +253,7 @@ func createTablesIfNotExist() {
 	);
 	`
 
-	create_downloaded := `
+	createDownloaded := `
 	CREATE TABLE IF NOT EXISTS downloads (
 		filename TEXT PRIMARY KEY,
 		hash TEXT NOT NULL,
@@ -258,28 +263,28 @@ func createTablesIfNotExist() {
 	);
 	`
 
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
 
 	if err == nil {
 		defer db.Close()
 
-		statement, err := db.Prepare(create_podcasts)
+		statement, err := db.Prepare(createPodcasts)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
 
-		statement, err = db.Prepare(create_episodes)
+		statement, err = db.Prepare(createEpisodes)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
 
-		statement, err = db.Prepare(create_episodes)
+		statement, err = db.Prepare(createEpisodes)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
 
-		statement, err = db.Prepare(create_downloaded)
+		statement, err = db.Prepare(createDownloaded)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
@@ -294,7 +299,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 	//   If yes then update the last seen timestamp
 	//   If no then add it to the db
 
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
 	if err == nil {
 		defer db.Close()
@@ -387,16 +392,16 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			ep[k] = v.(string)
 		}
 
-		podcastname_episodename := pod["title"] + ep["title"]
-		podcastname_episodename_hash := fmt.Sprintf("%x", md5.Sum([]byte(podcastname_episodename)))
-		file_url_hash := fmt.Sprintf("%x", md5.Sum([]byte(ep["file"])))
+		podcastnameEpisodeName := pod["title"] + ep["title"]
+		podcastnameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastnameEpisodeName)))
+		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep["file"])))
 
 		// Is it in the db?
 		rows, err := db.Query(`
 			SELECT count(*) AS COUNT
 			FROM episodes
 			WHERE podcastname_episodename_hash=?
-			;`, podcastname_episodename_hash)
+			;`, podcastnameEpisodenameHash)
 		checkErr(err)
 
 		var count int
@@ -450,8 +455,8 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			checkErr(err)
 
 			// Make sure descption does not contain HTML
-			non_html_desc := strip.StripTags(ep["description"])
-			ep["description"] = non_html_desc
+			nonHtmlDesc := strip.StripTags(ep["description"])
+			ep["description"] = nonHtmlDesc
 
 			// From author ... updated are just the keys in the episode map
 			if verbose {
@@ -471,7 +476,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				nullWrap(ep["updated"]),
 				ts, ts,
 				nullWrap(pod["title"]),
-				podcastname_episodename_hash, file_url_hash,
+				podcastnameEpisodenameHash, fileUrlHash,
 			)
 			checkErr(err)
 
@@ -485,12 +490,12 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 }
 
 // readConfig is a function which reads the configuration file and return slices with URLs for RSS files
-func readConfig(conf_file_path string) ([]string, error) {
-	content, err := ioutil.ReadFile(conf_file_path)
+func readConfig(confFilePath string) ([]string, error) {
+	content, err := ioutil.ReadFile(confFilePath)
 	validated := []string{}
 
 	if !errors.Is(err, os.ErrNotExist) {
-		l.Println("Configuration file at " + conf_file_path + " exists")
+		l.Println("Configuration file at " + confFilePath + " exists")
 	}
 
 	if err != nil {
@@ -507,7 +512,7 @@ func readConfig(conf_file_path string) ([]string, error) {
 	}
 
 	if verbose {
-		fmt.Printf("Feed URLs from config file %s:\n%s\n", conf_file_path, strings.Join(validated, "\n"))
+		fmt.Printf("Feed URLs from config file %s:\n%s\n", confFilePath, strings.Join(validated, "\n"))
 	}
 	l.Printf("%d valid URLs\n", len(validated))
 
@@ -520,12 +525,32 @@ func parseFeed(url string) (map[string]string, []M, error) {
 	defer cancel()
 
 	// Will throw the item maps in here
-	var s_items []M
+	var sItems []M
 	pod := make(map[string]string)
 
 	l.Println("Parsing " + url)
 
 	fp := gofeed.NewParser()
+
+	fp.Client = &http.Client{
+		// WRT: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
+		Timeout: 20 * time.Second,
+		// WRT: https://github.com/golang/go/issues/44267#issuecomment-819278575
+		Transport: &http.Transport{
+			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, // Go 1.8 only
+					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,   // Go 1.8 only
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				},
+			},
+		}}
+
 	feed, err := fp.ParseURLWithContext(url, ctx)
 
 	// If there is an error parsing the feed then return with the error
@@ -558,6 +583,8 @@ func parseFeed(url string) (map[string]string, []M, error) {
 	for idx := range feed.Items {
 		item := feed.Items[idx]
 
+		// Looks like:
+		//
 		// type Item struct {
 		//     Title           string                   `json:"title,omitempty"`
 		//     Description     string                   `json:"description,omitempty"`
@@ -580,7 +607,8 @@ func parseFeed(url string) (map[string]string, []M, error) {
 		//     Custom          map[string]string        `json:"custom,omitempty"`
 		// }
 
-		// We want
+		// We want:
+		//
 		//    "title", "language", "itunes:author", "feed_url", "link", "description",
 		//    "itunes:summary", "itunes:explicit", "enclosure"
 
@@ -657,27 +685,27 @@ func parseFeed(url string) (map[string]string, []M, error) {
 			i["episode"] = ""
 		}
 
-		s_items = append(s_items, i)
+		sItems = append(sItems, i)
 	}
 
-	return pod, s_items, err
+	return pod, sItems, err
 }
 
 // hashFromFilename returns the hash part from the filename
 // we can then compare this hash to what is in the db
 func hashFromFilename(filename string) (string, string) {
-	parsed_a := strings.ReplaceAll(filename, ".", "-")
-	parsed_b := strings.Split(parsed_a, "-")
-	n_parsed_b := len(parsed_b)
-	hash := parsed_b[n_parsed_b-2 : n_parsed_b-1][0]
-	transformed_title := parsed_b[n_parsed_b-3 : n_parsed_b-2][0]
-	return hash, transformed_title
+	parsedA := strings.ReplaceAll(filename, ".", "-")
+	parsedB := strings.Split(parsedA, "-")
+	nParsedB := len(parsedB)
+	hash := parsedB[nParsedB-2 : nParsedB-1][0]
+	transformedTitle := parsedB[nParsedB-3 : nParsedB-2][0]
+	return hash, transformedTitle
 }
 
 // sensibleFilesInDir returns a set of filenames that we identify as podcasts
 // Assumes .mp3 only
 func sensibleFilesInDir(path string) mapset.Set {
-	filenames_set := mapset.NewSet()
+	filenamesSet := mapset.NewSet()
 
 	files, err := os.ReadDir(path)
 	checkErr(err)
@@ -688,24 +716,24 @@ func sensibleFilesInDir(path string) mapset.Set {
 		if filename[:2] != "._" {
 			// Count the number of '-' occurances betcause if not 5 and with mp3 then not a well formed filename
 			if strings.Count(filename, "-") == 5 && strings.Contains(filename, "mp3") {
-				filenames_set.Add(filename)
+				filenamesSet.Add(filename)
 			}
 		}
 	}
 
-	return filenames_set
+	return filenamesSet
 }
 
 // seeWhatPodsWeAlreadyHave will check the db against files we already have
-func seeWhatPodsWeAlreadyHave(db_file string, path string) mapset.Set {
-	filenames_hash_set := mapset.NewSet()
-	db_hash_set := mapset.NewSet()
-	transformed_titles_set := mapset.NewSet()
-	filenames_set := mapset.NewSet()
-	hashes_to_ep_info := make(map[string]string)
-	transformed_titles_to_hashes := make(map[string]string)
-	hashes_to_transformed_titles := make(map[string]string)
-	tts_in_filesname := mapset.NewSet()
+func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
+	filenamesHashSet := mapset.NewSet()
+	dbHashSet := mapset.NewSet()
+	transformedTitlesSet := mapset.NewSet()
+	filenamesSet := mapset.NewSet()
+	hashesToEpInfo := make(map[string]string)
+	transformedTitlesToHashes := make(map[string]string)
+	hashesToTransformedTitles := make(map[string]string)
+	ttsInFilesname := mapset.NewSet()
 
 	files, err := os.ReadDir(path)
 	checkErr(err)
@@ -714,22 +742,22 @@ func seeWhatPodsWeAlreadyHave(db_file string, path string) mapset.Set {
 	for _, file := range files {
 		filename := file.Name()
 		if filename[:2] != "._" {
-			// Count the number of '-' occurances betcause if not 5 and with mp3 then not a well formed filename
+			// Count the number of '-' occurrences because if not 5 and with mp3 then not a well formed filename
 			if strings.Count(filename, "-") == 5 && strings.Contains(filename, "mp3") {
-				hash, transformed_title := hashFromFilename(filename)
-				filenames_hash_set.Add(hash)
-				filenames_set.Add(filename)
+				hash, transformedTitle := hashFromFilename(filename)
+				filenamesHashSet.Add(hash)
+				filenamesSet.Add(filename)
 
-				hashes_to_transformed_titles[hash] = transformed_title
-				transformed_titles_to_hashes[transformed_title] = hash
-				tts_in_filesname.Add(transformed_title)
+				hashesToTransformedTitles[hash] = transformedTitle
+				transformedTitlesToHashes[transformedTitle] = hash
+				ttsInFilesname.Add(transformedTitle)
 			}
 		}
 	}
-	filenames_slice := filenames_set.ToSlice()
+	filenamesSlice := filenamesSet.ToSlice()
 
 	// Get all the file_url_hashes from the db too and put them into another set
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
 
 	if err == nil {
@@ -737,116 +765,114 @@ func seeWhatPodsWeAlreadyHave(db_file string, path string) mapset.Set {
 	}
 
 	query := `SELECT podcast_title, title, file_url_hash FROM episodes WHERE file IS NOT NULL AND file !='';`
-
 	rows, err := db.Query(query)
 	checkErr(err)
 
 	// Iterate over the rows in the result
 	for rows.Next() {
 		// Data from db
-		var podcast_title, title, file_url_hash, transformed_title string
+		var podcastTitle, title, fileUrlHash, transformedTitle string
 
-		err = rows.Scan(&podcast_title, &title, &file_url_hash)
+		err = rows.Scan(&podcastTitle, &title, &fileUrlHash)
 		checkErr(err)
 
 		// sets and maps
-		transformed_title = titleTransformation(title)
-		transformed_titles_set.Add(transformed_title)
-		transformed_titles_to_hashes[transformed_title] = file_url_hash
-		hashes_to_transformed_titles[file_url_hash] = transformed_title
+		transformedTitle = titleTransformation(title)
+		transformedTitlesSet.Add(transformedTitle)
+		transformedTitlesToHashes[transformedTitle] = fileUrlHash
+		hashesToTransformedTitles[fileUrlHash] = transformedTitle
 
-		db_hash_set.Add(file_url_hash)
-		hashes_to_ep_info[file_url_hash] = fmt.Sprintf("%s: %s", podcast_title, title)
+		dbHashSet.Add(fileUrlHash)
+		hashesToEpInfo[fileUrlHash] = fmt.Sprintf("%s: %s", podcastTitle, title)
 	}
 
 	// slices for convenience
-	db_hash_slice := db_hash_set.ToSlice()
-	filesnames_hash_slice := filenames_hash_set.ToSlice()
-	transformed_titles_slice := transformed_titles_set.ToSlice()
+	dbHashSlice := dbHashSet.ToSlice()
+	filesnamesHashSlice := filenamesHashSet.ToSlice()
+	transformedTitlesSlice := transformedTitlesSet.ToSlice()
 
 	fmt.Printf(
 		"\n%d db hashes %d filename hashes %d map between the two\n",
-		len(db_hash_slice),
-		len(filesnames_hash_slice),
-		len(hashes_to_ep_info),
+		len(dbHashSlice),
+		len(filesnamesHashSlice),
+		len(hashesToEpInfo),
 	)
 
 	// whatever is in the db that we do not have as a file
-	in_db_not_in_file_set := db_hash_set.Difference(filenames_hash_set)
-	in_db_not_in_file_slice := in_db_not_in_file_set.ToSlice()
-	n_in_db_not_in_file := len(in_db_not_in_file_slice)
+	inDbNotInFileSet := dbHashSet.Difference(filenamesHashSet)
+	inDbNotInFileSlice := inDbNotInFileSet.ToSlice()
+	nInDbNotInFile := len(inDbNotInFileSlice)
 
-	fmt.Printf("\n%d in db and not in files based on file (URL) hashes\n\n", n_in_db_not_in_file)
+	fmt.Printf("\n%d in db and not in files based on file (URL) hashes\n\n", nInDbNotInFile)
 
 	// range over the transformed titles from the db
-	for _, transformed_title_from_db := range transformed_titles_slice {
+	for _, transformedTitleFromDb := range transformedTitlesSlice {
 		// Firstly see if it's in the hashes we are interested in
-		hash_of_interest := transformed_titles_to_hashes[transformed_title_from_db.(string)]
+		hashOfInterest := transformedTitlesToHashes[transformedTitleFromDb.(string)]
 		// if the hash is in the set of episodes in the db that we do not already have
-		if in_db_not_in_file_set.Contains(hash_of_interest) {
+		if inDbNotInFileSet.Contains(hashOfInterest) {
 			// l.Printf("Interested in transformed title %s", v_tts)
 			// If it is then do substring search against every filename
-			for _, v_fn := range filenames_slice {
+			for _, v_fn := range filenamesSlice {
 				filename := v_fn.(string)
-				transformed_title := transformed_title_from_db.(string)
+				transformedTitle := transformedTitleFromDb.(string)
 
 				// Potential addition: we could also look at the new hash, but this is less imported given we also compare titles below
-				if len(transformed_title) == 0 || strings.Contains(filename, transformed_title) {
+				if len(transformedTitle) == 0 || strings.Contains(filename, transformedTitle) {
 					// The transformed title is in a filename and so we can remove the hash in the filename
-					hash_to_remove := transformed_titles_to_hashes[transformed_title]
-					in_db_not_in_file_set.Remove(hash_to_remove)
+					hashToRemove := transformedTitlesToHashes[transformedTitle]
+					inDbNotInFileSet.Remove(hashToRemove)
 				}
 			}
 		}
 	}
 
-	in_db_not_in_file_slice = in_db_not_in_file_set.ToSlice()
-	n_in_db_not_in_file_slice := len(in_db_not_in_file_slice)
+	inDbNotInFileSlice = inDbNotInFileSet.ToSlice()
+	nInDbNotInFileSlice := len(inDbNotInFileSlice)
 
 	var fmt_str string
-	if n_in_db_not_in_file_slice > 0 {
+	if nInDbNotInFileSlice > 0 {
 		fmt_str = "%d podcasts are in the feeds which have not been downloaded; being:\n"
 	} else {
 		fmt_str = "%d podcasts are in the feeds which have not been downloaded\n"
 	}
-	fmt.Printf(fmt_str, n_in_db_not_in_file_slice)
+	fmt.Printf(fmt_str, nInDbNotInFileSlice)
 
 	// go through and remove anything with the same title
-	// reason for doing this is backwards compatability with my (pre-existing) collection of pods
+	// reason for doing this is backwards compatibility with my (pre-existing) collection of pods
 	// which used a different hash
 
 	// for range in the hashes
-	for _, v := range in_db_not_in_file_slice {
+	for _, v := range inDbNotInFileSlice {
 		// get the associated title
-		tt_of_interest := hashes_to_transformed_titles[v.(string)]
+		ttOfInterest := hashesToTransformedTitles[v.(string)]
 		// is the tranformed title in the set of what's in the filenames?
-		if tts_in_filesname.Contains(tt_of_interest) {
+		if ttsInFilesname.Contains(ttOfInterest) {
 			// if it is, remove it
-			in_db_not_in_file_set.Remove(v)
+			inDbNotInFileSet.Remove(v)
 		}
-
 	}
 
-	in_db_not_in_file_slice = in_db_not_in_file_set.ToSlice()
-	n_in_db_not_in_file_slice = len(in_db_not_in_file_slice)
+	inDbNotInFileSlice = inDbNotInFileSet.ToSlice()
+	nInDbNotInFileSlice = len(inDbNotInFileSlice)
 
-	if n_in_db_not_in_file_slice > 0 {
+	if nInDbNotInFileSlice > 0 {
 		fmt_str = "%d podcasts are in the feeds which have not been downloaded after fn title scan; being:\n"
 	} else {
 		fmt_str = "%d podcasts are in the feeds which have not been downloaded after fn title scan\n"
 	}
-	fmt.Printf(fmt_str, n_in_db_not_in_file_slice)
+	fmt.Printf(fmt_str, nInDbNotInFileSlice)
 
 	counter := 0
-	for _, v := range in_db_not_in_file_slice {
+	for _, v := range inDbNotInFileSlice {
 		hash := v.(string)
-		title := hashes_to_ep_info[hash]
-		t_title := hashes_to_transformed_titles[hash]
+		title := hashesToEpInfo[hash]
+		tTitle := hashesToTransformedTitles[hash]
 
-		fmt.Printf("%s (%s) (db hash %s)\n", title, t_title, hash)
+		fmt.Printf("%s (%s) (db hash %s)\n", title, tTitle, hash)
 
-		if len([]rune(t_title)) == 0 {
-			l.Fatal("No t_title")
+		if len([]rune(tTitle)) == 0 {
+			l.Fatal("No tTitle")
 		}
 
 		counter += 1
@@ -857,42 +883,47 @@ func seeWhatPodsWeAlreadyHave(db_file string, path string) mapset.Set {
 	}
 
 	// Return the pod episodes we want to download
-	return in_db_not_in_file_set
+	return inDbNotInFileSet
 }
 
 // titleTransformation takes a podcast title and transforms it (removing spaces etc)
 // so it can sensibly be used in the podcast filename
 func titleTransformation(s string) string {
-	// Get rid of any quotation characters
-	var s_c string
-	s_a := strings.ReplaceAll(s, "\"", "")
-	s_b := strings.ReplaceAll(s_a, "'", "")
 
-	// Make the string less than 100 chars if it is more than that
-	if len(s_b) > 100 {
-		s_c = s_b[:100]
+	// Reflect strings.Title functionality; strings.Title is deprecated
+	caser := cases.Title(language.English)
+
+	// Get rid of any quotation characters
+	var sC string
+	sA := strings.ReplaceAll(s, "\"", "")
+	sB := strings.ReplaceAll(sA, "'", "")
+
+	// Make the string less than 100 runes if it is more than that
+	if len(sB) > 100 {
+		sC = sB[:100]
 	} else {
-		s_c = s_b
+		sC = sB
 	}
 
 	// Get the words and join them together with _
-	regex_s := `[A-Za-z]+`
-	re := regexp.MustCompile(regex_s)
-	str_slice := re.FindAllStringSubmatch(s_c, -1)
+	regexS := `[A-Za-z]+`
+	re := regexp.MustCompile(regexS)
+	strSlice := re.FindAllStringSubmatch(sC, -1)
 
-	new_str := make([]string, 0)
+	newStr := make([]string, 0)
 
-	for _, v := range str_slice {
+	for _, v := range strSlice {
 		s := v[0]
 		// If the word is all upper case make it title case
 		if isUpper(s) {
-			new_str = append(new_str, strings.Title(strings.ToLower(s)))
+			buff := caser.String(strings.ToLower(s))
+			newStr = append(newStr, buff)
 		} else {
-			new_str = append(new_str, s)
+			newStr = append(newStr, s)
 		}
 	}
 
-	return strings.Join(new_str, "_")
+	return strings.Join(newStr, "_")
 }
 
 // genScriptLine generate our wget shell command give a URL and filename
@@ -902,8 +933,8 @@ func genScriptLine(url string, filename string) string {
 }
 
 // generateDownloadList generates download script based on the pods to download
-func generateDownloadList(podcasts_dir string) {
-	hashes := seeWhatPodsWeAlreadyHave(db_file, podcasts_dir)
+func generateDownloadList(podcastsDir string) {
+	hashes := seeWhatPodsWeAlreadyHave(dbFile, podcastsDir)
 
 	l.Println("Pods for download are")
 
@@ -914,7 +945,7 @@ func generateDownloadList(podcasts_dir string) {
 	// this sensibly handles the case where the published tag is not provided in the feed
 	query := `SELECT podcast_title, IFNULL(published, first_seen), title, podcastname_episodename_hash, file_url_hash, file FROM episodes WHERE file != '' AND file IS NOT NULL;`
 
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
 
 	if err == nil {
@@ -929,20 +960,19 @@ func generateDownloadList(podcasts_dir string) {
 
 	for rows.Next() {
 		// Data from db
-		var podcast_title, published, title, podcastname_episodename_hash, file_url_hash, file string
-		err = rows.Scan(&podcast_title, &published, &title, &podcastname_episodename_hash, &file_url_hash, &file)
+		var podcastTitle, published, title, podcastnameEpisodenameHash, fileUrlHash, file string
+		err = rows.Scan(&podcastTitle, &published, &title, &podcastnameEpisodenameHash, &fileUrlHash, &file)
 		checkErr(err)
 
 		// If file_url_hash in hashes ...
-		if hashes.Contains(file_url_hash) {
-			transformed_title := titleTransformation(title)
-			transformed_podcast_title := titleTransformation(podcast_title)
-			short_date_a := []rune(published)
-			short_date := string(short_date_a[:10])
+		if hashes.Contains(fileUrlHash) {
+			transformedTitle := titleTransformation(title)
+			transformedPodcastTitle := titleTransformation(podcastTitle)
+			shortDateA := []rune(published)
+			shortDate := string(shortDateA[:10])
 
-			new_filename := fmt.Sprintf("%s-%s-%s-%s.mp3", transformed_podcast_title, short_date, transformed_title, podcastname_episodename_hash)
-
-			filenames = append(filenames, new_filename)
+			newFilename := fmt.Sprintf("%s-%s-%s-%s.mp3", transformedPodcastTitle, shortDate, transformedTitle, podcastnameEpisodenameHash)
+			filenames = append(filenames, newFilename)
 			urls = append(urls, file)
 		}
 	}
@@ -968,13 +998,13 @@ func generateDownloadList(podcasts_dir string) {
 		printSome(lines)
 	}
 
-	// then we scan for the files and add those that went into the script to the download_hopper table
+	// Then we scan for the files and add those that went into the script to the download_hopper table
 	// if they are in fact in the folder i.e. downloaded
+	filename := podcastsDir + "/download_pods.sh"
+	linesJoined := strings.Join(lines, "\n")
 
-	filename := podcasts_dir + "/download_pods.sh"
-	lines_joined := strings.Join(lines, "\n")
 	// Potential addition: permissions should probably be narrower
-	err = ioutil.WriteFile(filename, []byte(lines_joined), 0666)
+	err = ioutil.WriteFile(filename, []byte(linesJoined), 0666)
 	checkErr(err)
 
 	l.Printf("Written script to %s", filename)
@@ -1022,14 +1052,16 @@ func updateDatabaseForDownloads() {
 	files := sensibleFilesInDir(cwd).ToSlice()
 
 	// Open db
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
+
 	if err == nil {
 		defer db.Close()
 	}
 
 	// Update or insert as appropriate
 	for _, file := range files {
+
 		// See if it's in already
 		rows, err := db.Query(`
 			SELECT count(*) AS COUNT
@@ -1103,9 +1135,9 @@ func updateDatabaseForDownloads() {
 // tagSinglePod tags the file at filename with the title and album metadata
 func tagSinglePod(filename string, title string, album string) {
 	// title tag is title
-	// album is podcast_title
-	// genre is "Podcast"
+	// album is podcast title
 
+	// genre is "Podcast"
 	genre := "Podcast"
 	var parse bool = true
 
@@ -1127,30 +1159,25 @@ func tagSinglePod(filename string, title string, album string) {
 	}
 
 	// If we get to here then we're writing
-	ascii_title := cleanText(title, len(title))
-	ascii_album := cleanText(album, len(album))
-	ascii_genre := cleanText(genre, len(genre))
-
-	// Remove all existing frames
-	// particularly anything in comment and lyrics as there can be garbage in there (again Risky Talk podcast looking at you lol)
-
-	// tag.DeleteAllFrames()
+	asciiTitle := cleanText(title, len(title))
+	asciiAlbum := cleanText(album, len(album))
+	asciiGenre := cleanText(genre, len(genre))
 
 	if parse {
 		// If parsed then set only if not equal to what we would set them to
-		if tag.Title() != ascii_title {
-			tag.SetTitle(ascii_title)
+		if tag.Title() != asciiTitle {
+			tag.SetTitle(asciiTitle)
 		}
-		if tag.Album() != ascii_album {
-			tag.SetAlbum(ascii_album)
+		if tag.Album() != asciiAlbum {
+			tag.SetAlbum(asciiAlbum)
 		}
-		if tag.Genre() != ascii_genre {
-			tag.SetGenre(ascii_genre)
+		if tag.Genre() != asciiGenre {
+			tag.SetGenre(asciiGenre)
 		}
 	} else {
-		tag.SetTitle(ascii_title)
-		tag.SetAlbum(ascii_album)
-		tag.SetGenre(ascii_genre)
+		tag.SetTitle(asciiTitle)
+		tag.SetAlbum(asciiAlbum)
+		tag.SetGenre(asciiGenre)
 	}
 
 	// Want to mentioned that we tagged the files!
@@ -1166,7 +1193,7 @@ func tagSinglePod(filename string, title string, album string) {
 	err = tag.Save()
 
 	if err != nil {
-		fmt.Println("Title:", ascii_title, "Album:", ascii_album, "Genre:", ascii_genre)
+		fmt.Println("Title:", asciiTitle, "Album:", asciiAlbum, "Genre:", asciiGenre)
 	}
 	checkErr(err)
 }
@@ -1174,7 +1201,6 @@ func tagSinglePod(filename string, title string, album string) {
 // tagThosePods tag all the podcasts
 func tagThosePods(podcasts_dir string) int {
 	fmt.Printf("Note: will tag pods in current working directory %s\n", getCwd())
-	// fmt.Println("If the count is 0 make sure you ran -u after downloading")
 
 	filenames_set := mapset.NewSet()
 
@@ -1192,7 +1218,7 @@ func tagThosePods(podcasts_dir string) int {
 	;
 	`
 	// Open db
-	db, err := sql.Open("sqlite3", db_file)
+	db, err := sql.Open("sqlite3", dbFile)
 	checkErr(err)
 	if err == nil {
 		defer db.Close()
@@ -1202,6 +1228,7 @@ func tagThosePods(podcasts_dir string) int {
 	checkErr(err)
 
 	// If it is, update last_seen
+	// count tracks the number of rows / loop iterations
 	var count int = 0
 	for rows.Next() {
 		var ns_filename, ns_podcast_title, ns_title, ns_description sql.NullString
@@ -1218,8 +1245,8 @@ func tagThosePods(podcasts_dir string) int {
 		count += 1
 		// Set of filenames we need to update in the db
 		filenames_set.Add(ns_filename)
-
 	}
+
 	l.Printf("Been through tagging on %d files", count)
 
 	if count == 0 {
@@ -1253,7 +1280,7 @@ func tagThosePods(podcasts_dir string) int {
 	return count
 }
 
-// parseThem parse each of the feeds in the config file
+// parseThem parses each of the feeds in the config file
 func parseThem(conf_file_path string) {
 	urls, err := readConfig(conf_file_path + "/gopodder.conf")
 	checkErr(err)
@@ -1266,7 +1293,7 @@ func parseThem(conf_file_path string) {
 	}
 }
 
-// init() function is called automatically before main() in Go
+// init function is called automatically before main() in Go
 // we use this to set up the logger and some globals
 func init() {
 	// logger
@@ -1281,7 +1308,7 @@ func init() {
 	podcasts_dir_default = cwd
 }
 
-// getCwd stops me from running this in my gopodder repo
+// cwdCheck stops me from running this in my gopodder repo
 // TODO: this doesn't generalise
 func cwdCheck(cwd string) {
 	if cwd == "/home/mike/repos/gopodder" || cwd == "/usr/home/mike/repos/gopodder" {
@@ -1308,10 +1335,11 @@ func main() {
 		podcasts_dir = podcasts_dir_default
 	}
 
-	// argparse biz
+	// Parse command line arguments
 
+	// This is our help message with %s placeholders
 	helpstring := `
-Incrementally download and tag podcasts. Requires wget
+Incrementally download and tag podcasts. Requires wget and eyeD3
 
 Typical use:
 	-p to parse
@@ -1354,7 +1382,7 @@ Note:
 	}
 
 	// In case of error print error and print usage
-	// This can also be done by passing -h or --help flags
+	// this can also be done by passing -h or --help flags
 	if err != nil {
 		fmt.Print(parser.Usage(err))
 	}
@@ -1365,7 +1393,6 @@ Note:
 
 	// Given we know we have gone past the help message now let's
 	// warn people if we are using defaults
-
 	tmp_fmt := "%s is not set; using default, value is %s\n"
 	if !conf_var_isset {
 		l.Printf(tmp_fmt, conf_var_envname, conf_file_path)
@@ -1380,6 +1407,7 @@ Note:
 		// If we are downloading we make sure we are not downloading into home or similar
 		cwdCheck(cwd)
 	}
+
 	// First let's get the tables ready to go and create them if not
 	createTablesIfNotExist()
 
@@ -1413,6 +1441,5 @@ Note:
 		if *experimental_opt {
 			fmt.Println("Nothing to see here")
 		}
-
 	}
 }
