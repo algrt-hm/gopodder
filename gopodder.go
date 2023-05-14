@@ -41,14 +41,32 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-// Set here as assume this will be fine for most cases
-var dbFile string = "gopodder.sqlite"
+// Convenience constants
+const gopodder = "gopodder"
+const confFile = gopodder + ".conf"
+const dbFileName = gopodder + ".sqlite"
+const confVarEnvName = "GOPODCONF"
+const pathVarEnvName = "GOPODDIR"
+const sqlite3 = "sqlite3" // Used with sql.Open
+const author = "author"
+const category = "category"
+const description = "description"
+const language_ = "language"
+const link = "link"
+const title = "title"
+const episode = "episode"
+const file = "file"
+const format = "format"
+const guid = "guid"
+const published = "published"
+const updated = "updated"
+const mp3 = "mp3"
 
 // These globals will be set in init()
 var l *log.Logger // Logger
 var ts string     // This will be starting timestamp
-var conf_file_path_default string
-var podcasts_dir_default string
+var confFilePathDefault string
+var podcastsDirDefault string
 var verbose bool = false // Verbosity
 var cwd string           // Current working directory
 
@@ -220,7 +238,6 @@ func getCwd() string {
 func createTablesIfNotExist() {
 	createPodcasts := `
 	CREATE TABLE IF NOT EXISTS podcasts (
-		-- no idx needed as sqllite provides rowid
 		title TEXT PRIMARY KEY,
 		author TEXT,
 		description TEXT,
@@ -263,7 +280,7 @@ func createTablesIfNotExist() {
 	);
 	`
 
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 
 	if err == nil {
@@ -299,7 +316,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 	//   If yes then update the last seen timestamp
 	//   If no then add it to the db
 
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 	if err == nil {
 		defer db.Close()
@@ -310,7 +327,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		SELECT count(*) AS COUNT
 		FROM podcasts
 		WHERE podcasts.title=?
-		;`, pod["title"])
+		;`, pod[title])
 	checkErr(err)
 
 	var count int
@@ -320,13 +337,13 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 	}
 
 	if count > 1 {
-		l.Fatalln(pod["title"], "is in the db more than once, this should not happen")
+		l.Fatalln(pod[title], "is in the db more than once, this should not happen")
 	}
 
 	//   If yes then update the last seen timestamp
 	if count == 1 {
 		if verbose {
-			l.Println(pod["title"], "is already in the db")
+			l.Println(pod[title], "is already in the db")
 		}
 
 		stmt, err := db.Prepare(`
@@ -336,7 +353,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			;`)
 		checkErr(err)
 
-		res, err := stmt.Exec(ts, pod["title"])
+		res, err := stmt.Exec(ts, pod[title])
 		checkErr(err)
 
 		affected, err := res.RowsAffected()
@@ -349,7 +366,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 
 	//   If no then add it to the db
 	if count == 0 {
-		l.Println(pod["title"], "is not in the db and seems to be a new podcast, adding")
+		l.Println(pod[title], "is not in the db and seems to be a new podcast, adding")
 
 		stmt, err := db.Prepare(`
 			INSERT INTO podcasts
@@ -361,12 +378,12 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 
 		// We wrap these because we don't want empty strings in the db ideally
 		res, err := stmt.Exec(
-			nullWrap(pod["author"]),
-			nullWrap(pod["category"]),
-			nullWrap(pod["description"]),
-			nullWrap(pod["language"]),
-			nullWrap(pod["link"]),
-			nullWrap(pod["title"]),
+			nullWrap(pod[author]),
+			nullWrap(pod[category]),
+			nullWrap(pod[description]),
+			nullWrap(pod[language_]),
+			nullWrap(pod[link]),
+			nullWrap(pod[title]),
 			ts,
 			ts,
 		)
@@ -375,7 +392,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		idx, err := res.LastInsertId()
 		checkErr(err)
 		if verbose {
-			l.Println("insert id for podcast", pod["title"], "is", idx)
+			l.Println("insert id for podcast", pod[title], "is", idx)
 		}
 	}
 
@@ -392,16 +409,16 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			ep[k] = v.(string)
 		}
 
-		podcastnameEpisodeName := pod["title"] + ep["title"]
-		podcastnameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastnameEpisodeName)))
-		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep["file"])))
+		podcastNameEpisodeName := pod[title] + ep[title]
+		podcastNameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastNameEpisodeName)))
+		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep[file])))
 
 		// Is it in the db?
 		rows, err := db.Query(`
 			SELECT count(*) AS COUNT
 			FROM episodes
 			WHERE podcastname_episodename_hash=?
-			;`, podcastnameEpisodenameHash)
+			;`, podcastNameEpisodenameHash)
 		checkErr(err)
 
 		var count int
@@ -411,12 +428,12 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		}
 
 		if count > 1 {
-			l.Fatalln(ep["title"], "is in the db more than once, this should not happen")
+			l.Fatalln(ep[title], "is in the db more than once, this should not happen")
 		}
 
 		if count == 1 {
 			if verbose {
-				l.Println(ep["title"], "is already in the db")
+				l.Println(ep[title], "is already in the db")
 			}
 
 			stmt, err := db.Prepare(`
@@ -426,7 +443,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				;`)
 			checkErr(err)
 
-			res, err := stmt.Exec(ts, ep["title"])
+			res, err := stmt.Exec(ts, ep[title])
 			checkErr(err)
 
 			affected, err := res.RowsAffected()
@@ -454,9 +471,9 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				);`)
 			checkErr(err)
 
-			// Make sure descption does not contain HTML
-			nonHtmlDesc := strip.StripTags(ep["description"])
-			ep["description"] = nonHtmlDesc
+			// Make sure description does not contain HTML
+			nonHtmlDesc := strip.StripTags(ep[description])
+			ep[description] = nonHtmlDesc
 
 			// From author ... updated are just the keys in the episode map
 			if verbose {
@@ -464,26 +481,28 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			}
 
 			res, err := stmt.Exec(
-				nullWrap(ep["author"]),
-				nullWrap(ep["description"]),
-				nullWrap(ep["episode"]),
-				nullWrap(ep["file"]),
-				nullWrap(ep["format"]),
-				nullWrap(ep["guid"]),
-				nullWrap(ep["link"]),
-				nullWrap(ep["published"]),
-				nullWrap(ep["title"]),
-				nullWrap(ep["updated"]),
-				ts, ts,
-				nullWrap(pod["title"]),
-				podcastnameEpisodenameHash, fileUrlHash,
+				nullWrap(ep[author]),
+				nullWrap(ep[description]),
+				nullWrap(ep[episode]),
+				nullWrap(ep[file]),
+				nullWrap(ep[format]),
+				nullWrap(ep[guid]),
+				nullWrap(ep[link]),
+				nullWrap(ep[published]),
+				nullWrap(ep[title]),
+				nullWrap(ep[updated]),
+				ts,
+				ts,
+				nullWrap(pod[title]),
+				podcastNameEpisodenameHash,
+				fileUrlHash,
 			)
 			checkErr(err)
 
 			idx, err := res.LastInsertId()
 			checkErr(err)
 			if verbose {
-				l.Println("insert id for episode", ep["title"], "is", idx)
+				l.Println("insert id for episode", ep[title], "is", idx)
 			}
 		}
 	}
@@ -533,9 +552,9 @@ func parseFeed(url string) (map[string]string, []M, error) {
 	fp := gofeed.NewParser()
 
 	fp.Client = &http.Client{
-		// WRT: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
+		// Extend the timeout a bit. See also: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
 		Timeout: 20 * time.Second,
-		// WRT: https://github.com/golang/go/issues/44267#issuecomment-819278575
+		// Allow various ciphers. See also: https://github.com/golang/go/issues/44267#issuecomment-819278575
 		Transport: &http.Transport{
 			TLSHandshakeTimeout: 10 * time.Second,
 			TLSClientConfig: &tls.Config{
@@ -560,7 +579,7 @@ func parseFeed(url string) (map[string]string, []M, error) {
 
 	// Podcast metadata
 	if len(feed.Authors) == 1 {
-		pod["author"] = strings.TrimSpace(feed.Authors[0].Name)
+		pod[author] = strings.TrimSpace(feed.Authors[0].Name)
 	} else {
 		if len(feed.Authors) == 0 {
 			// No authors
@@ -573,11 +592,11 @@ func parseFeed(url string) (map[string]string, []M, error) {
 		}
 	}
 
-	pod["title"] = strings.TrimSpace(feed.Title)
-	pod["link"] = strings.TrimSpace(feed.Link)
-	pod["description"] = strings.TrimSpace(feed.Description)
-	pod["language"] = strings.TrimSpace(feed.Language)
-	pod["category"] = strings.TrimSpace(strings.Join(feed.Categories, ", "))
+	pod[title] = strings.TrimSpace(feed.Title)
+	pod[link] = strings.TrimSpace(feed.Link)
+	pod[description] = strings.TrimSpace(feed.Description)
+	pod[language_] = strings.TrimSpace(feed.Language)
+	pod[category] = strings.TrimSpace(strings.Join(feed.Categories, ", "))
 
 	// Episodes metadata
 	for idx := range feed.Items {
@@ -614,25 +633,25 @@ func parseFeed(url string) (map[string]string, []M, error) {
 
 		i := make(M)
 
-		i["title"] = strings.TrimSpace(item.Title)
+		i[title] = strings.TrimSpace(item.Title)
 
 		// Potential addition: use itunes:author if missing
 		// Potential addition: Loop through for authors and handle >1
 		if len(item.Authors) == 1 {
-			i["author"] = strings.TrimSpace(item.Authors[0].Name)
+			i[author] = strings.TrimSpace(item.Authors[0].Name)
 		} else {
 			if len(item.Authors) == 0 {
 				// No authors
-				i["author"] = ""
+				i[author] = ""
 			} else {
 				l.Println("More than one author")
 				l.Println(item.Authors)
 			}
 		}
 
-		i["link"] = strings.TrimSpace(item.Link)
-		i["description"] = strings.TrimSpace(item.Description)
-		i["guid"] = strings.TrimSpace(item.GUID)
+		i[link] = strings.TrimSpace(item.Link)
+		i[description] = strings.TrimSpace(item.Description)
+		i[guid] = strings.TrimSpace(item.GUID)
 
 		// Change anything time.Time into a string
 		// this is buffer value
@@ -640,22 +659,22 @@ func parseFeed(url string) (map[string]string, []M, error) {
 
 		if item.UpdatedParsed != nil {
 			t = *item.UpdatedParsed
-			i["updated"] = t.Format(time.RFC3339)
+			i[updated] = t.Format(time.RFC3339)
 		} else {
-			i["updated"] = ""
+			i[updated] = ""
 		}
 
 		if item.PublishedParsed != nil {
 			t = *item.PublishedParsed
-			i["published"] = t.Format(time.RFC3339)
+			i[published] = t.Format(time.RFC3339)
 		} else {
-			i["published"] = ""
+			i[published] = ""
 		}
 
 		// Assumes only one enclosure
 		if len(item.Enclosures) == 1 {
-			i["file"] = strings.TrimSpace(item.Enclosures[0].URL)
-			i["format"] = strings.TrimSpace(item.Enclosures[0].Type)
+			i[file] = strings.TrimSpace(item.Enclosures[0].URL)
+			i[format] = strings.TrimSpace(item.Enclosures[0].Type)
 		} else {
 			if len(item.Enclosures) == 0 {
 				// Enclosures is empty
@@ -669,20 +688,20 @@ func parseFeed(url string) (map[string]string, []M, error) {
 		// iTunes extension to spec (not always present)
 		if item.ITunesExt != nil {
 			// If author is an empty string (i.e. false) then use the iTunes author
-			if i["author"] == "" {
-				i["author"] = strings.TrimSpace(item.ITunesExt.Author)
+			if i[author] == "" {
+				i[author] = strings.TrimSpace(item.ITunesExt.Author)
 			}
 
 			// Pick up itunes episode while we are at in
-			i["episode"] = strings.TrimSpace(item.ITunesExt.Episode)
+			i[episode] = strings.TrimSpace(item.ITunesExt.Episode)
 
 			// If desc is empty use itunes summary
-			if i["description"] == "" {
-				i["description"] = strings.TrimSpace(item.ITunesExt.Summary)
+			if i[description] == "" {
+				i[description] = strings.TrimSpace(item.ITunesExt.Summary)
 			}
 		} else {
 			// Set episode to empty string if we have not picked it up
-			i["episode"] = ""
+			i[episode] = ""
 		}
 
 		sItems = append(sItems, i)
@@ -714,8 +733,8 @@ func sensibleFilesInDir(path string) mapset.Set {
 	for _, file := range files {
 		filename := file.Name()
 		if filename[:2] != "._" {
-			// Count the number of '-' occurances betcause if not 5 and with mp3 then not a well formed filename
-			if strings.Count(filename, "-") == 5 && strings.Contains(filename, "mp3") {
+			// Count the number of '-' occurrences because if not (5 and filename contains mp3) then not a well formed filename
+			if strings.Count(filename, "-") == 5 && strings.Contains(filename, mp3) {
 				filenamesSet.Add(filename)
 			}
 		}
@@ -733,7 +752,7 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	hashesToEpInfo := make(map[string]string)
 	transformedTitlesToHashes := make(map[string]string)
 	hashesToTransformedTitles := make(map[string]string)
-	ttsInFilesname := mapset.NewSet()
+	ttsInFileNames := mapset.NewSet()
 
 	files, err := os.ReadDir(path)
 	checkErr(err)
@@ -743,21 +762,21 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 		filename := file.Name()
 		if filename[:2] != "._" {
 			// Count the number of '-' occurrences because if not 5 and with mp3 then not a well formed filename
-			if strings.Count(filename, "-") == 5 && strings.Contains(filename, "mp3") {
+			if strings.Count(filename, "-") == 5 && strings.Contains(filename, mp3) {
 				hash, transformedTitle := hashFromFilename(filename)
 				filenamesHashSet.Add(hash)
 				filenamesSet.Add(filename)
 
 				hashesToTransformedTitles[hash] = transformedTitle
 				transformedTitlesToHashes[transformedTitle] = hash
-				ttsInFilesname.Add(transformedTitle)
+				ttsInFileNames.Add(transformedTitle)
 			}
 		}
 	}
 	filenamesSlice := filenamesSet.ToSlice()
 
 	// Get all the file_url_hashes from the db too and put them into another set
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFile)
 	checkErr(err)
 
 	if err == nil {
@@ -788,13 +807,13 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 
 	// slices for convenience
 	dbHashSlice := dbHashSet.ToSlice()
-	filesnamesHashSlice := filenamesHashSet.ToSlice()
+	fileNamesHashSlice := filenamesHashSet.ToSlice()
 	transformedTitlesSlice := transformedTitlesSet.ToSlice()
 
 	fmt.Printf(
 		"\n%d db hashes %d filename hashes %d map between the two\n",
 		len(dbHashSlice),
-		len(filesnamesHashSlice),
+		len(fileNamesHashSlice),
 		len(hashesToEpInfo),
 	)
 
@@ -846,8 +865,8 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	for _, v := range inDbNotInFileSlice {
 		// get the associated title
 		ttOfInterest := hashesToTransformedTitles[v.(string)]
-		// is the tranformed title in the set of what's in the filenames?
-		if ttsInFilesname.Contains(ttOfInterest) {
+		// is the transformed title in the set of what's in the filenames?
+		if ttsInFileNames.Contains(ttOfInterest) {
 			// if it is, remove it
 			inDbNotInFileSet.Remove(v)
 		}
@@ -934,7 +953,7 @@ func genScriptLine(url string, filename string) string {
 
 // generateDownloadList generates download script based on the pods to download
 func generateDownloadList(podcastsDir string) {
-	hashes := seeWhatPodsWeAlreadyHave(dbFile, podcastsDir)
+	hashes := seeWhatPodsWeAlreadyHave(dbFileName, podcastsDir)
 
 	l.Println("Pods for download are")
 
@@ -945,7 +964,7 @@ func generateDownloadList(podcastsDir string) {
 	// this sensibly handles the case where the published tag is not provided in the feed
 	query := `SELECT podcast_title, IFNULL(published, first_seen), title, podcastname_episodename_hash, file_url_hash, file FROM episodes WHERE file != '' AND file IS NOT NULL;`
 
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 
 	if err == nil {
@@ -960,8 +979,8 @@ func generateDownloadList(podcastsDir string) {
 
 	for rows.Next() {
 		// Data from db
-		var podcastTitle, published, title, podcastnameEpisodenameHash, fileUrlHash, file string
-		err = rows.Scan(&podcastTitle, &published, &title, &podcastnameEpisodenameHash, &fileUrlHash, &file)
+		var podcastTitle, published, title, podcastNameEpisodenameHash, fileUrlHash, file string
+		err = rows.Scan(&podcastTitle, &published, &title, &podcastNameEpisodenameHash, &fileUrlHash, &file)
 		checkErr(err)
 
 		// If file_url_hash in hashes ...
@@ -971,7 +990,7 @@ func generateDownloadList(podcastsDir string) {
 			shortDateA := []rune(published)
 			shortDate := string(shortDateA[:10])
 
-			newFilename := fmt.Sprintf("%s-%s-%s-%s.mp3", transformedPodcastTitle, shortDate, transformedTitle, podcastnameEpisodenameHash)
+			newFilename := fmt.Sprintf("%s-%s-%s-%s.%s", transformedPodcastTitle, shortDate, transformedTitle, podcastNameEpisodenameHash, mp3)
 			filenames = append(filenames, newFilename)
 			urls = append(urls, file)
 		}
@@ -1052,7 +1071,7 @@ func updateDatabaseForDownloads() {
 	files := sensibleFilesInDir(cwd).ToSlice()
 
 	// Open db
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 
 	if err == nil {
@@ -1138,7 +1157,7 @@ func tagSinglePod(filename string, title string, album string) {
 	// album is podcast title
 
 	// genre is "Podcast"
-	genre := "Podcast"
+	const genre = "Podcast"
 	var parse bool = true
 
 	tag, err := id3v2.Open(filename, id3v2.Options{Parse: parse})
@@ -1185,7 +1204,7 @@ func tagSinglePod(filename string, title string, album string) {
 		Encoding:    tag.DefaultEncoding(),
 		Language:    "eng",
 		Description: "Tagged by",
-		Text:        "gopodder",
+		Text:        gopodder,
 	}
 	tag.AddCommentFrame(comment)
 
@@ -1218,7 +1237,7 @@ func tagThosePods(podcasts_dir string) int {
 	;
 	`
 	// Open db
-	db, err := sql.Open("sqlite3", dbFile)
+	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 	if err == nil {
 		defer db.Close()
@@ -1273,7 +1292,7 @@ func tagThosePods(podcasts_dir string) int {
 
 		// Done message
 		if podcasts_dir != cwd {
-			fmt.Printf("Now we are done with tagging you can move your podcasts from the current directory to your podcast directory with \nmv ./*mp3 %s\n", podcasts_dir)
+			fmt.Printf("Now we are done with tagging you can move your podcasts from the current directory to your podcast directory with \nmv ./*%s %s\n", mp3, podcasts_dir)
 		}
 	}
 
@@ -1282,7 +1301,7 @@ func tagThosePods(podcasts_dir string) int {
 
 // parseThem parses each of the feeds in the config file
 func parseThem(conf_file_path string) {
-	urls, err := readConfig(conf_file_path + "/gopodder.conf")
+	urls, err := readConfig(conf_file_path + "/" + confFile)
 	checkErr(err)
 
 	for _, url := range urls {
@@ -1304,41 +1323,39 @@ func init() {
 
 	// defaults for conf file and podcast dir
 	cwd = getCwd()
-	conf_file_path_default = cwd
-	podcasts_dir_default = cwd
+	confFilePathDefault = cwd
+	podcastsDirDefault = cwd
 }
 
 // cwdCheck stops me from running this in my gopodder repo
 // TODO: this doesn't generalise
 func cwdCheck(cwd string) {
 	if cwd == "/home/mike/repos/gopodder" || cwd == "/usr/home/mike/repos/gopodder" {
-		fmt.Println("Quiting as cwd=", cwd)
+		fmt.Println("Exiting as cwd is", cwd)
 		os.Exit(1)
 	}
 }
 
 func main() {
 	// Get conf file path from env
-	conf_var_envname := "GOPODCONF"
-	conf_file_path, conf_var_isset := os.LookupEnv(conf_var_envname)
+	confFilePath, confVarIsSet := os.LookupEnv(confVarEnvName)
 
-	path_var_envname := "GOPODDIR"
-	podcasts_dir, path_var_isset := os.LookupEnv(path_var_envname)
+	podcastsDir, pathVarIsSet := os.LookupEnv(pathVarEnvName)
 
 	// Use default if not set
 	// we let the user know a bit further down
-	if !conf_var_isset {
-		conf_file_path = conf_file_path_default
+	if !confVarIsSet {
+		confFilePath = confFilePathDefault
 	}
 
-	if !path_var_isset {
-		podcasts_dir = podcasts_dir_default
+	if !pathVarIsSet {
+		podcastsDir = podcastsDirDefault
 	}
 
 	// Parse command line arguments
 
 	// This is our help message with %s placeholders
-	helpstring := `
+	helpMessage := `
 Incrementally download and tag podcasts. Requires wget and eyeD3
 
 Typical use:
@@ -1361,23 +1378,22 @@ Note:
 	}
 
 	// Create new parser object
-	parser := argparse.NewParser(os.Args[0], fmt.Sprintf(helpstring, cwd, conf_file_path, cwd, podcasts_dir))
+	parser := argparse.NewParser(os.Args[0], fmt.Sprintf(helpMessage, cwd, confFilePath, cwd, podcastsDir))
 
 	// Create flag(s)
-	parse_opt_ptr := parser.Flag("p", "parse", &argparse.Options{Required: false, Help: "Parse podcast feeds"})
-	see_opt_ptr := parser.Flag("s", "see", &argparse.Options{Required: false, Help: "See what pods we already have and write script"})
-	download_pods := parser.Flag("d", "download", &argparse.Options{Required: false, Help: "Download pods from script written with -s/--see"})
-	post_dl_update := parser.Flag("u", "update", &argparse.Options{Required: false, Help: "Update db for what we have downloaded"})
-	tag_pods := parser.Flag("t", "tag", &argparse.Options{Required: false, Help: "Tag freshly downloaded pods"})
-	do_all := parser.Flag("a", "all", &argparse.Options{Required: false, Help: "Same as -psdut"})
-	verbose_opt := parser.Flag("v", "verbose", &argparse.Options{Required: false, Help: "Verbose"})
-	experimental_opt := parser.Flag("e", "experimental", &argparse.Options{Required: false, Help: "WIP"})
+	parseOptPtr := parser.Flag("p", "parse", &argparse.Options{Required: false, Help: "Parse podcast feeds"})
+	seeOptPtr := parser.Flag("s", "see", &argparse.Options{Required: false, Help: "See what pods we already have and write script"})
+	downloadPods := parser.Flag("d", "download", &argparse.Options{Required: false, Help: "Download pods from script written with -s/--see"})
+	postDlUpdate := parser.Flag("u", "update", &argparse.Options{Required: false, Help: "Update db for what we have downloaded"})
+	tagPods := parser.Flag("t", "tag", &argparse.Options{Required: false, Help: "Tag freshly downloaded pods"})
+	doAll := parser.Flag("a", "all", &argparse.Options{Required: false, Help: "Same as -psdut"})
+	verboseOpt := parser.Flag("v", "verbose", &argparse.Options{Required: false, Help: "Verbose"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
 
 	// Set global if verbose flag set
-	if *verbose_opt {
+	if *verboseOpt {
 		verbose = true
 	}
 
@@ -1387,23 +1403,23 @@ Note:
 		fmt.Print(parser.Usage(err))
 	}
 
-	if parse_opt_ptr == nil || see_opt_ptr == nil {
+	if parseOptPtr == nil || seeOptPtr == nil {
 		l.Fatal("Some issue with argparse")
 	}
 
 	// Given we know we have gone past the help message now let's
 	// warn people if we are using defaults
 	tmp_fmt := "%s is not set; using default, value is %s\n"
-	if !conf_var_isset {
-		l.Printf(tmp_fmt, conf_var_envname, conf_file_path)
+	if !confVarIsSet {
+		l.Printf(tmp_fmt, confVarEnvName, confFilePath)
 	}
 
-	if !path_var_isset {
-		l.Printf(tmp_fmt, path_var_envname, podcasts_dir)
+	if !pathVarIsSet {
+		l.Printf(tmp_fmt, pathVarEnvName, podcastsDir)
 	}
 
 	cwd := getCwd()
-	if *do_all || *download_pods {
+	if *doAll || *downloadPods {
 		// If we are downloading we make sure we are not downloading into home or similar
 		cwdCheck(cwd)
 	}
@@ -1411,35 +1427,31 @@ Note:
 	// First let's get the tables ready to go and create them if not
 	createTablesIfNotExist()
 
-	if *do_all {
-		parseThem(conf_file_path)
-		generateDownloadList(podcasts_dir)
-		runDownloadScript(podcasts_dir)
+	if *doAll {
+		parseThem(confFilePath)
+		generateDownloadList(podcastsDir)
+		runDownloadScript(podcastsDir)
 		updateDatabaseForDownloads()
-		tagThosePods(podcasts_dir)
+		tagThosePods(podcastsDir)
 	} else {
-		if *parse_opt_ptr {
-			parseThem(conf_file_path)
+		if *parseOptPtr {
+			parseThem(confFilePath)
 		}
 
-		if *see_opt_ptr {
-			generateDownloadList(podcasts_dir)
+		if *seeOptPtr {
+			generateDownloadList(podcastsDir)
 		}
 
-		if *download_pods {
-			runDownloadScript(podcasts_dir)
+		if *downloadPods {
+			runDownloadScript(podcastsDir)
 		}
 
-		if *post_dl_update {
+		if *postDlUpdate {
 			updateDatabaseForDownloads()
 		}
 
-		if *tag_pods {
-			tagThosePods(podcasts_dir)
-		}
-
-		if *experimental_opt {
-			fmt.Println("Nothing to see here")
+		if *tagPods {
+			tagThosePods(podcastsDir)
 		}
 	}
 }
