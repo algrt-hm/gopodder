@@ -1337,12 +1337,20 @@ func cwdCheck(cwd string) {
 }
 
 type latestPodResult struct {
-	published sql.NullString
 	author    sql.NullString
 	title     sql.NullString
+	published sql.NullString
 }
 
-func lastestPodsFromDb(path string) int {
+func nullStrToStr(s sql.NullString) string {
+	if s.Valid {
+		return s.String
+	} else {
+		return "?"
+	}
+}
+
+func lastestPodsFromDb(path string) {
 	// TODO: other places should also take into account the full path to the db
 	// rather than assuming it will be in cwd/same place as the binary
 
@@ -1356,31 +1364,39 @@ func lastestPodsFromDb(path string) int {
 		defer db.Close()
 	}
 
-	// query := "select COALESCE(author,'missing'), COALESCE(title, 'missing'), COALESCE(file, 'missing') from episodes order by published desc limit 5;"
-	query := "select author, title, file from episodes order by published desc limit 5;"
+	query := "select author, title, published from episodes order by published desc limit 100;"
 
 	rows, err := db.Query(query)
 	checkErr(err)
 
 	var count int
-	var singleLatestPodResult latestPodResult
-	appendo := make([]latestPodResult, 0)
+	var latest latestPodResult
+	var tsStr string
 
 	for rows.Next() {
-		err = rows.Scan(&singleLatestPodResult.author, &singleLatestPodResult.title, &singleLatestPodResult.published)
+		err = rows.Scan(&latest.author, &latest.title, &latest.published)
 		checkErr(err)
 		count += 1
-		appendo = append(appendo, singleLatestPodResult)
-	}
 
-	// Now create a map we can sort
-	return count
+		if latest.published.Valid {
+			tt, err := time.Parse(time.RFC3339, latest.published.String)
+			checkErr(err)
+			tsStr = tt.Format("2 January 2006 15:04 MST")
+		} else {
+			tsStr = "missing"
+		}
+
+		fmt.Printf("%s / %s / %s\n",
+			tsStr,
+			nullStrToStr(latest.author),
+			nullStrToStr(latest.title),
+		)
+	}
 }
 
 func main() {
 	// Get conf file path from env
 	confFilePath, confVarIsSet := os.LookupEnv(confVarEnvName)
-
 	podcastsDir, pathVarIsSet := os.LookupEnv(pathVarEnvName)
 
 	// Use default if not set
@@ -1409,7 +1425,7 @@ Typical use:
 	-a will do each of the above in order
 
 Utility:
-	-l will list the latest podcasts
+	-l will list the 100 latest podcasts
 
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
@@ -1500,8 +1516,7 @@ Note:
 		}
 
 		if *listLatestPods {
-			ret := lastestPodsFromDb(confFilePath)
-			fmt.Printf("There are %d podcasts in the db\n", ret)
+			lastestPodsFromDb(confFilePath)
 		}
 	}
 }
