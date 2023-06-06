@@ -1336,6 +1336,12 @@ func cwdCheck(cwd string) {
 	}
 }
 
+type latestPodResult struct {
+	published sql.NullString
+	author    sql.NullString
+	title     sql.NullString
+}
+
 func lastestPodsFromDb(path string) int {
 	// TODO: other places should also take into account the full path to the db
 	// rather than assuming it will be in cwd/same place as the binary
@@ -1350,24 +1356,24 @@ func lastestPodsFromDb(path string) int {
 		defer db.Close()
 	}
 
-	query := "select filename from downloads order by tagged_at desc"
+	// query := "select COALESCE(author,'missing'), COALESCE(title, 'missing'), COALESCE(file, 'missing') from episodes order by published desc limit 5;"
+	query := "select author, title, file from episodes order by published desc limit 5;"
 
 	rows, err := db.Query(query)
 	checkErr(err)
 
 	var count int
-	var filename string
-	appendo := make([]string, 0)
+	var singleLatestPodResult latestPodResult
+	appendo := make([]latestPodResult, 0)
 
 	for rows.Next() {
-		err = rows.Scan(&filename)
+		err = rows.Scan(&singleLatestPodResult.author, &singleLatestPodResult.title, &singleLatestPodResult.published)
 		checkErr(err)
 		count += 1
-		appendo = append(appendo, filename)
+		appendo = append(appendo, singleLatestPodResult)
 	}
 
 	// Now create a map we can sort
-
 	return count
 }
 
@@ -1494,7 +1500,8 @@ Note:
 		}
 
 		if *listLatestPods {
-			lastestPodsFromDb(confFilePath)
+			ret := lastestPodsFromDb(confFilePath)
+			fmt.Printf("There are %d podcasts in the db\n", ret)
 		}
 	}
 }
