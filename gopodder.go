@@ -1336,6 +1336,41 @@ func cwdCheck(cwd string) {
 	}
 }
 
+func lastestPodsFromDb(path string) int {
+	// TODO: other places should also take into account the full path to the db
+	// rather than assuming it will be in cwd/same place as the binary
+
+	newDbFileName := path + "/" + dbFileName
+
+	db, err := sql.Open(sqlite3, newDbFileName)
+	checkErr(err)
+
+	if err == nil {
+		fmt.Printf("Connected to db %s\n", newDbFileName)
+		defer db.Close()
+	}
+
+	query := "select filename from downloads order by tagged_at desc"
+
+	rows, err := db.Query(query)
+	checkErr(err)
+
+	var count int
+	var filename string
+	appendo := make([]string, 0)
+
+	for rows.Next() {
+		err = rows.Scan(&filename)
+		checkErr(err)
+		count += 1
+		appendo = append(appendo, filename)
+	}
+
+	// Now create a map we can sort
+
+	return count
+}
+
 func main() {
 	// Get conf file path from env
 	confFilePath, confVarIsSet := os.LookupEnv(confVarEnvName)
@@ -1367,6 +1402,9 @@ Typical use:
 
 	-a will do each of the above in order
 
+Utility:
+	-l will list the latest podcasts
+
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
 	will save pods into %s; and
@@ -1388,6 +1426,7 @@ Note:
 	tagPods := parser.Flag("t", "tag", &argparse.Options{Required: false, Help: "Tag freshly downloaded pods"})
 	doAll := parser.Flag("a", "all", &argparse.Options{Required: false, Help: "Same as -psdut"})
 	verboseOpt := parser.Flag("v", "verbose", &argparse.Options{Required: false, Help: "Verbose"})
+	listLatestPods := parser.Flag("l", "list", &argparse.Options{Required: false, Help: "List latest pods"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -1452,6 +1491,10 @@ Note:
 
 		if *tagPods {
 			tagThosePods(podcastsDir)
+		}
+
+		if *listLatestPods {
+			lastestPodsFromDb(confFilePath)
 		}
 	}
 }
