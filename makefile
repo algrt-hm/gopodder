@@ -1,5 +1,9 @@
+.POSIX:
 
 all: gopodder
+
+test:
+	go test -timeout 30s -run ^TestCheckDependencies$$ gopodder
 
 dev: clean gopodder
 #	go test -timeout 30s -run ^TestLastestPodsFromDb$$ gopodder

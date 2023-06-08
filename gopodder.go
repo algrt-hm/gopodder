@@ -61,14 +61,19 @@ const guid = "guid"
 const published = "published"
 const updated = "updated"
 const mp3 = "mp3"
+const eyeD3 = "eyeD3"
 
 // These globals will be set in init()
 var l *log.Logger // Logger
 var ts string     // This will be starting timestamp
 var confFilePathDefault string
 var podcastsDirDefault string
-var verbose bool = false // Verbosity
+var verbose bool = false // Verbosity. TODO: use this more often to reduce the output a bit
 var cwd string           // Current working directory
+
+// TODO: Should refactor so these are not globals
+var pythonPath string
+var eyeD3Path string
 
 // M is an alias for map[string]interface{}
 type M map[string]interface{}
@@ -92,6 +97,119 @@ func checkErr(err error) {
 		_, _, line, _ := runtime.Caller(1)
 		l.Fatalf("%s (called from: %d)", err, line)
 	}
+}
+
+// isExecAny returns true if any of the execute bits are set
+// Source: https://stackoverflow.com/a/60128480
+func isExecAny(mode os.FileMode) bool {
+	return mode&0111 != 0
+}
+
+// readFirstLine reads the first line of a script
+// and returns the interpreter (shebang) path
+func readFirstLine(path string) string {
+	data, err := os.ReadFile(path)
+	checkErr(err)
+	// sheBang is the first line of the script (no jokes please)
+	// https://en.wikipedia.org/wiki/Shebang_(Unix)
+	sheBang := strings.Split(string(data), "\n")[0]
+	return strings.Replace(sheBang, "#!", "", 1)
+}
+
+// getExecutableFileNames returns a slice of strings of executable files in a directory
+func getExecutableFileNames(dir string) ([]string, error) {
+	var files []string
+
+	fd, err := os.Open(dir)
+	if err != nil {
+		return files, err
+	}
+
+	fileInfo, err := fd.Readdir(-1)
+	fd.Close()
+	if err != nil {
+		return files, err
+	}
+
+	for _, file := range fileInfo {
+		if isExecAny(file.Mode()) {
+			files = append(files, file.Name())
+		}
+	}
+
+	return files, nil
+}
+
+// checkDependencies checks if wget and eyeD3 are in PATH
+// and returns the python interpreter path associated with eyeD3, the path of eyeD3
+func checkDependencies(verbose bool) (bool, string, string) {
+	// check path is set
+	path := os.Getenv("PATH")
+	// set to false, meaning missing, by default
+	haveWget := false
+	haveEyeD3 := false
+	// set to empty string by default
+	pythonInterpreter := ""
+	eyeD3Dir := ""
+
+	if path == "" {
+		l.Fatal("PATH does not seem to be set in environment")
+	}
+
+	pathDirs := strings.Split(path, ":")
+	nPathDirs := len(pathDirs)
+
+	for idx, dir := range pathDirs {
+		if verbose {
+			l.Printf("Checking PATH dir %d/%d: %s", idx+1, nPathDirs, dir)
+		}
+		filesInFolder, err := getExecutableFileNames(dir)
+
+		if err != nil {
+			if verbose {
+				l.Printf("Error reading files in %s: %s", dir, err)
+			}
+			continue
+		}
+
+		for _, fileIn := range filesInFolder {
+			if fileIn == "wget" {
+				haveWget = true
+			}
+			if fileIn == eyeD3 {
+				haveEyeD3 = true
+				eyeD3Dir = dir
+			}
+			if haveWget && haveEyeD3 {
+				break
+			}
+		}
+	}
+
+	if haveEyeD3 {
+		l.Printf("%s found in %s", eyeD3, eyeD3Dir)
+		eyeD3Path := eyeD3Dir + "/" + eyeD3
+		pythonInterpreter = readFirstLine(eyeD3Path)
+	}
+
+	if haveWget && haveEyeD3 {
+		l.Printf("Dependencies look good: have wget and %s", eyeD3)
+		return true, pythonInterpreter, eyeD3Dir
+	}
+
+	l.Printf("PATH contains %d folders: %s", nPathDirs, path)
+	if !haveWget {
+		l.Println("FAIL: no wget")
+		return false, pythonInterpreter, eyeD3Dir
+	}
+
+	if !haveEyeD3 {
+		l.Printf("FAIL: no %s", eyeD3)
+		return false, pythonInterpreter, eyeD3Dir
+	}
+
+	l.Println("FAIL: unknown reason")
+	return false, pythonInterpreter, eyeD3Dir
 }
 
 // printSome is a utility function to print a few items from a slice
@@ -548,7 +666,6 @@ func parseFeed(url string) (map[string]string, []M, error) {
 	pod := make(map[string]string)
 
 	l.Println("Parsing " + url)
-
 	fp := gofeed.NewParser()
 
 	fp.Client = &http.Client{
@@ -947,8 +1064,7 @@ func titleTransformation(s string) string {
 
 // genScriptLine generate our wget shell command give a URL and filename
 func genScriptLine(url string, filename string) string {
-	cmd := "wget --no-clobber --continue --no-check-certificate --no-verbose"
-	return fmt.Sprintf("%s '%s' -O '%s' && chmod 666 '%s'", cmd, url, filename, filename)
+	return fmt.Sprintf("wget --no-clobber --continue --no-check-certificate --no-verbose '%s' -O '%s' && chmod 666 '%s'", url, filename, filename)
 }
 
 // generateDownloadList generates download script based on the pods to download
@@ -1029,18 +1145,17 @@ func generateDownloadList(podcastsDir string) {
 	l.Printf("Written script to %s", filename)
 }
 
-// runEyed3 runs the eyeD3 command to strip tags from the mp3 file
-// TODO: path is FreeBSD specific
-func runEyed3(filename string) {
-	fmt.Println("Reading with eyeD3:")
-	cmd := exec.Command("/usr/local/bin/python3.9", "/usr/local/bin/eyeD3", filename)
+// runEyeD3 runs the eyeD3 command to strip tags from the mp3 file
+func runEyeD3(filename string, pythonPath string, eyeD3Path string) {
+	fmt.Printf("Reading with %s:", eyeD3)
+	cmd := exec.Command(pythonPath, eyeD3Path, filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	checkErr(err)
 
-	fmt.Println("Removing tags with eyeD3:")
-	cmd = exec.Command("/usr/local/bin/python3.9", "/usr/local/bin/eyeD3", "--remove-all", filename)
+	fmt.Printf("Removing tags with %s:", eyeD3)
+	cmd = exec.Command(pythonPath, eyeD3Path, "--remove-all", filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
@@ -1164,12 +1279,7 @@ func tagSinglePod(filename string, title string, album string) {
 
 	if err != nil {
 		fmt.Printf("%s is a file where reading the tags has been problematic %s\n", filename, err)
-		// fmt.Printf("You can try blitzing the tag data with: eyeD3 --remove-all %s", filename)
-		runEyed3(filename)
-
-		// e.g.
-		// eyeD3 --remove-all Entitled_Opinions_about_Life_and_Literature-2021-12-03-The_Uses_of_Trauma_with_Alex_Rex-96de32981a4c34a2ca933854613183ee.mp3
-
+		runEyeD3(filename, pythonPath, eyeD3Path)
 		parse = false
 		tag, err = id3v2.Open(filename, id3v2.Options{Parse: parse})
 		checkErr(err)
@@ -1325,6 +1435,7 @@ func init() {
 	cwd = getCwd()
 	confFilePathDefault = cwd
 	podcastsDirDefault = cwd
+
 }
 
 // cwdCheck stops me from running this in my gopodder repo
@@ -1350,7 +1461,7 @@ func nullStrToStr(s sql.NullString) string {
 	}
 }
 
-func lastestPodsFromDb(path string) {
+func latestPodsFromDb(path string) {
 	// TODO: other places should also take into account the full path to the db
 	// rather than assuming it will be in cwd/same place as the binary
 
@@ -1425,7 +1536,7 @@ Typical use:
 	-a will do each of the above in order
 
 Utility:
-	-l will list the 100 latest podcasts
+	-l will list the (up to) 100 latest podcasts from the db
 
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
@@ -1479,6 +1590,23 @@ Note:
 		l.Printf(tmp_fmt, pathVarEnvName, podcastsDir)
 	}
 
+	// Check we have dependencies and get python path
+	haveDependancies, python, eyeD3Dir := checkDependencies(verbose)
+
+	// Set globals
+	// TODO: globals should be refactored out
+	pythonPath = python
+	eyeD3Path = eyeD3Dir
+
+	l.Printf("Have dependencies: %t", haveDependancies)
+	l.Printf("python path is %s", pythonPath)
+	l.Printf("eyeD3 folder is %s", eyeD3Path)
+
+	// If we don't have dependencies then we exit
+	if !haveDependancies {
+		l.Fatal("Exiting as we do not have dependancies")
+	}
+
 	cwd := getCwd()
 	if *doAll || *downloadPods {
 		// If we are downloading we make sure we are not downloading into home or similar
@@ -1516,7 +1644,7 @@ Note:
 		}
 
 		if *listLatestPods {
-			lastestPodsFromDb(confFilePath)
+			latestPodsFromDb(confFilePath)
 		}
 	}
 }
