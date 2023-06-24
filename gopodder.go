@@ -1448,9 +1448,10 @@ func cwdCheck(cwd string) {
 }
 
 type latestPodResult struct {
-	author    sql.NullString
-	title     sql.NullString
-	published sql.NullString
+	author        sql.NullString
+	title         sql.NullString
+	published     sql.NullString
+	podcast_title sql.NullString
 }
 
 func nullStrToStr(s sql.NullString) string {
@@ -1475,7 +1476,14 @@ func latestPodsFromDb(path string) {
 		defer db.Close()
 	}
 
-	query := "select author, title, published from episodes order by published desc limit 100;"
+	query := `select 
+	  author, 
+	  title, 
+	  published,
+	  podcast_title 
+	from episodes 
+	order by published desc 
+	limit 100;`
 
 	rows, err := db.Query(query)
 	checkErr(err)
@@ -1485,7 +1493,12 @@ func latestPodsFromDb(path string) {
 	var tsStr string
 
 	for rows.Next() {
-		err = rows.Scan(&latest.author, &latest.title, &latest.published)
+		err = rows.Scan(
+			&latest.author,
+			&latest.title,
+			&latest.published,
+			&latest.podcast_title,
+		)
 		checkErr(err)
 		count += 1
 
@@ -1494,12 +1507,13 @@ func latestPodsFromDb(path string) {
 			checkErr(err)
 			tsStr = tt.Format("2 January 2006 15:04 MST")
 		} else {
-			tsStr = "missing"
+			tsStr = "?"
 		}
 
-		fmt.Printf("%s / %s / %s\n",
+		fmt.Printf("%s / %s / %s / %s\n",
 			tsStr,
 			nullStrToStr(latest.author),
+			nullStrToStr(latest.podcast_title),
 			nullStrToStr(latest.title),
 		)
 	}
