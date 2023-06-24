@@ -61,6 +61,7 @@ I use `gopodder` in a cron script like the below.
 cd /home/user/podcasts
 GOPODCONF=`pwd` GOPODDIR=`pwd` ./gopodder -a >> pods.log 2>&1
 ```
+(This assumes pods.log already exists, can `touch pods.log` if not)
 
 2. Secondly, the line in the cron script itself to run every day at 7am.
 
