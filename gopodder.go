@@ -1147,6 +1147,11 @@ func generateDownloadList(podcastsDir string) {
 
 // runEyeD3 runs the eyeD3 command to strip tags from the mp3 file
 func runEyeD3(filename string, pythonPath string, eyeD3Path string) {
+	t := eyeD3Path + "/" + eyeD3
+	eyeD3Path = t
+
+	fmt.Printf("Using: %s %s %s\n", pythonPath, eyeD3Path, filename)
+
 	fmt.Printf("Reading with %s:", eyeD3)
 	cmd := exec.Command(pythonPath, eyeD3Path, filename)
 	cmd.Stdout = os.Stdout
