@@ -93,8 +93,19 @@ func nullWrap(s string) sql.NullString {
 
 // checkErr is a utility function to checkErr err and also give line number of the calling function
 func checkErr(err error) {
-	if err != nil {
-		_, _, line, _ := runtime.Caller(1)
+	// fine to crack on if err == nil
+	if err == nil {
+		return
+	}
+
+	// we want to print so get the line number
+	_, _, line, _ := runtime.Caller(1)
+
+	// if a http error then just print it
+	if strings.Contains(err.Error(), "http error") {
+		l.Printf("%s (called from: %d)", err, line)
+		// otherwise bork on non-http errors
+	} else {
 		l.Fatalf("%s (called from: %d)", err, line)
 	}
 }

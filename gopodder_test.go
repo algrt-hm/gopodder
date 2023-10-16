@@ -35,3 +35,11 @@ func TestCleanText(t *testing.T) {
 		t.Errorf("got %q, wanted %q", got, want)
 	}
 }
+
+// func TestCheckErr(t *testing.T) {
+// 	err := fmt.Errorf("http error: 403 Forbidden")
+// 	checkErr(err)
+
+// 	err = fmt.Errorf("http error: 500 Internal Server Error")
+// 	checkErr(err)
+// }
