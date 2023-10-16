@@ -91,6 +91,16 @@ func nullWrap(s string) sql.NullString {
 	}
 }
 
+// isHttpError is a utility function to check if an error is a http error
+func isHttpError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// implied else
+	return strings.Contains(err.Error(), "http error")
+}
+
 // checkErr is a utility function to checkErr err and also give line number of the calling function
 func checkErr(err error) {
 	// fine to crack on if err == nil
@@ -102,7 +112,7 @@ func checkErr(err error) {
 	_, _, line, _ := runtime.Caller(1)
 
 	// if a http error then just print it
-	if strings.Contains(err.Error(), "http error") {
+	if isHttpError(err) {
 		l.Printf("%s (called from: %d)", err, line)
 		// otherwise bork on non-http errors
 	} else {
@@ -1433,8 +1443,9 @@ func parseThem(conf_file_path string) {
 	for _, url := range urls {
 		podcast, episodes, err := parseFeed(url)
 		checkErr(err)
-
-		podEpisodesIntoDatabase(podcast, episodes)
+		if !isHttpError(err) {
+			podEpisodesIntoDatabase(podcast, episodes)
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -36,10 +37,25 @@ func TestCleanText(t *testing.T) {
 	}
 }
 
-// func TestCheckErr(t *testing.T) {
-// 	err := fmt.Errorf("http error: 403 Forbidden")
-// 	checkErr(err)
+func TestIsHttpError(t *testing.T) {
+	err := fmt.Errorf("http error: 403 Forbidden")
+	got := isHttpError(err)
+	want := true
+	if got != want {
+		t.Errorf("got %v, wanted %v", got, want)
+	}
 
-// 	err = fmt.Errorf("http error: 500 Internal Server Error")
-// 	checkErr(err)
-// }
+	err = fmt.Errorf("http error: 500 Internal Server Error")
+	got = isHttpError(err)
+	want = true
+	if got != want {
+		t.Errorf("got %v, wanted %v", got, want)
+	}
+
+	err = fmt.Errorf("some random error")
+	got = isHttpError(err)
+	want = false
+	if got != want {
+		t.Errorf("got %v, wanted %v", got, want)
+	}
+}
