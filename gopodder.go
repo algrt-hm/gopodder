@@ -691,7 +691,7 @@ func parseFeed(url string) (map[string]string, []M, error) {
 
 	fp.Client = &http.Client{
 		// Extend the timeout a bit. See also: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
-		Timeout: 20 * time.Second,
+		Timeout: 60 * time.Second,
 		// Allow various ciphers. See also: https://github.com/golang/go/issues/44267#issuecomment-819278575
 		Transport: &http.Transport{
 			TLSHandshakeTimeout: 10 * time.Second,
@@ -707,6 +707,9 @@ func parseFeed(url string) (map[string]string, []M, error) {
 				},
 			},
 		}}
+
+	// Change the user agent to something that looks like Chrome/Brave
+	fp.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
 
 	feed, err := fp.ParseURLWithContext(url, ctx)
 
