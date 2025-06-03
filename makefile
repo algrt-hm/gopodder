@@ -1,19 +1,26 @@
 .POSIX:
 
+name = gopodder
+
 all: build
 
-dev:
-	GOPODCONF="/titanium/new_podcasts" GOPODDIR="/titanium/new_podcasts" ./gopodder -l
+format:
+	go fmt *.go
 
-test: clean gopodder
+# TODO
+dev:
+	GOPODCONF="/titanium/new_podcasts" GOPODDIR="/titanium/new_podcasts" ./$(name) -l
+
+# TODO
+test: clean $(name)
 #	go test -timeout 30s -run ^TestLastestPodsFromDb$$ gopodder
 #	go test -timeout 30s -run ^TestCheckDependencies$$ gopodder
-	GOPODCONF="/titanium/new_podcasts" GOPODDIR="/titanium/new_podcasts" ./gopodder -l
+	GOPODCONF="/titanium/new_podcasts" GOPODDIR="/titanium/new_podcasts" ./$(name) -l
 
 build:
-	go build gopodder.go
+	go build -o $(name) *.go
 
 clean:
-	rm ./gopodder
+	rm ./$(name)
 
 .PHONY: clean

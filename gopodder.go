@@ -8,37 +8,19 @@
 package main
 
 import (
-	"context"
-	"crypto/md5"
-	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"net/http"
+	logger "log"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"regexp"
-	"runtime"
 	"strings"
 	"time"
-	"unicode"
 
-	"github.com/akamensky/argparse"
-	"github.com/bogem/id3v2/v2"
-	mapset "github.com/deckarep/golang-set"
-	"github.com/forPelevin/gomoji"
-	strip "github.com/grokify/html-strip-tags-go"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/mmcdole/gofeed"
-
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
-	"golang.org/x/text/runes"
-	"golang.org/x/text/transform"
-	"golang.org/x/text/unicode/norm"
+	"github.com/akamensky/argparse"         // akin to Python argparse
+	"github.com/bogem/id3v2/v2"             // id3v2 library
+	mapset "github.com/deckarep/golang-set" // allows easy set functionality
+	_ "github.com/mattn/go-sqlite3"         // sqlite3 driver that conforms to the built-in database/sql interface
 )
 
 // Convenience constants
@@ -64,596 +46,27 @@ const mp3 = "mp3"
 const eyeD3 = "eyeD3"
 
 // These globals will be set in init()
-var l *log.Logger // Logger
-var ts string     // This will be starting timestamp
+var log *logger.Logger // Logger
+var ts string          // This will be starting timestamp
 var confFilePathDefault string
 var podcastsDirDefault string
-var verbose bool = false // Verbosity. TODO: use this more often to reduce the output a bit
+var verbose bool = false // Verbosity. TODO: this should use the logger and loglevels
 var cwd string           // Current working directory
 
 // TODO: Should refactor so these are not globals
-var pythonPath string
+var pythonInterpreterPath string
 var eyeD3Path string
 
 // M is an alias for map[string]interface{}
 type M map[string]interface{}
 
-// nullWrap is a utility function to convert a string to NullString if empty
-// Lifted from: https://stackoverflow.com/questions/40266633/golang-insert-null-into-sql-instead-of-empty-string
-func nullWrap(s string) sql.NullString {
-	if len(strings.TrimSpace(s)) == 0 {
-		return sql.NullString{}
-	}
-	// implied else
-	return sql.NullString{
-		String: s,
-		Valid:  true,
-	}
-}
-
-// isHttpError is a utility function to check if an error is a http error
-func isHttpError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// implied else
-	return strings.Contains(err.Error(), "http error")
-}
-
-// checkErr is a utility function to checkErr err and also give line number of the calling function
-func checkErr(err error) {
-	// fine to crack on if err == nil
-	if err == nil {
-		return
-	}
-
-	// we want to print so get the line number
-	_, _, line, _ := runtime.Caller(1)
-
-	// if a http error then just print it
-	if isHttpError(err) {
-		l.Printf("%s (called from: %d)", err, line)
-		// otherwise bork on non-http errors
-	} else {
-		l.Fatalf("%s (called from: %d)", err, line)
-	}
-}
-
-// isExecAny returns true if any of the execute bits are set
-// Source: https://stackoverflow.com/a/60128480
-func isExecAny(mode os.FileMode) bool {
-	return mode&0111 != 0
-}
-
-// readFirstLine reads the first line of a script
-// and returns the interpreter (shebang) path
-func readFirstLine(path string) string {
-	data, err := os.ReadFile(path)
-	checkErr(err)
-	// sheBang is the first line of the script (no jokes please)
-	// https://en.wikipedia.org/wiki/Shebang_(Unix)
-	sheBang := strings.Split(string(data), "\n")[0]
-	return strings.Replace(sheBang, "#!", "", 1)
-}
-
-// getExecutableFileNames returns a slice of strings of executable files in a directory
-func getExecutableFileNames(dir string) ([]string, error) {
-	var files []string
-
-	fd, err := os.Open(dir)
-	if err != nil {
-		return files, err
-	}
-
-	fileInfo, err := fd.Readdir(-1)
-	fd.Close()
-	if err != nil {
-		return files, err
-	}
-
-	for _, file := range fileInfo {
-		if isExecAny(file.Mode()) {
-			files = append(files, file.Name())
-		}
-	}
-
-	return files, nil
-}
-
-// checkDependencies checks if wget and eyeD3 are in PATH
-// and returns the python interpreter path associated with eyeD3, the path of eyeD3
-func checkDependencies(verbose bool) (bool, string, string) {
-	// check path is set
-	path := os.Getenv("PATH")
-	// set to false, meaning missing, by default
-	haveWget := false
-	haveEyeD3 := false
-	// set to empty string by default
-	pythonInterpreter := ""
-	eyeD3Dir := ""
-
-	if path == "" {
-		l.Fatal("PATH does not seem to be set in environment")
-	}
-
-	pathDirs := strings.Split(path, ":")
-	nPathDirs := len(pathDirs)
-
-	for idx, dir := range pathDirs {
-		if verbose {
-			l.Printf("Checking PATH dir %d/%d: %s", idx+1, nPathDirs, dir)
-		}
-		filesInFolder, err := getExecutableFileNames(dir)
-
-		if err != nil {
-			if verbose {
-				l.Printf("Error reading files in %s: %s", dir, err)
-			}
-			continue
-		}
-
-		for _, fileIn := range filesInFolder {
-			if fileIn == "wget" {
-				haveWget = true
-			}
-			if fileIn == eyeD3 {
-				haveEyeD3 = true
-				eyeD3Dir = dir
-			}
-			if haveWget && haveEyeD3 {
-				break
-			}
-		}
-	}
-
-	if haveEyeD3 {
-		l.Printf("%s found in %s", eyeD3, eyeD3Dir)
-		eyeD3Path := eyeD3Dir + "/" + eyeD3
-		pythonInterpreter = readFirstLine(eyeD3Path)
-	}
-
-	if haveWget && haveEyeD3 {
-		l.Printf("Dependencies look good: have wget and %s", eyeD3)
-		return true, pythonInterpreter, eyeD3Dir
-	}
-
-	l.Printf("PATH contains %d folders: %s", nPathDirs, path)
-	if !haveWget {
-		l.Println("FAIL: no wget")
-		return false, pythonInterpreter, eyeD3Dir
-	}
-
-	if !haveEyeD3 {
-		l.Printf("FAIL: no %s", eyeD3)
-		return false, pythonInterpreter, eyeD3Dir
-	}
-
-	l.Println("FAIL: unknown reason")
-	return false, pythonInterpreter, eyeD3Dir
-}
-
-// printSome is a utility function to print a few items from a slice
-func printSome(sliceOfStr []string) {
-	counter := 0
-	for _, str := range sliceOfStr {
-		fmt.Println(str)
-		counter += 1
-		if counter > 3 {
-			fmt.Printf("And many more ...\n\n")
-			break
-		}
-	}
-}
-
-// removeAccents removes accents from a string
-// Lifted from: https://stackoverflow.com/a/65981868
-func removeAccents(s string) string {
-	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
-	result, _, err := transform.String(t, s)
-	checkErr(err)
-	return result
-}
-
-// cleanText removes/sorts unicode characters; this is because id2v3 < 2.4
-// does not support unicode
-// Lifted from: https://gist.github.com/jheth/1e74039003c52cb46a16e9eb799846a4
-func cleanText(text string, maxLength int) string {
-	if len(text) < 5 {
-		return ""
-	}
-
-	if strings.Contains(text, "\n") {
-		sections := strings.Split(text, "\n")
-		newText := sections[0]
-		for idx, s := range sections {
-			// Append sections until we reach the max length
-			if idx > 0 && len(newText) < maxLength {
-				newText = newText + " " + s
-			}
-		}
-		text = newText
-	}
-
-	var charMap = map[string]string{
-		"′":          "'",
-		"|":          "",
-		"\u20ac":     "e",   // euro
-		"\u0026":     "and", // ampersand
-		"\u1ebd":     "e",
-		"\u200b":     " ",
-		"\u200e":     " ",
-		"\u2010":     "-",
-		"\u2013":     "-",
-		"\u2014":     "-",
-		"\u2018":     "'",
-		"\u2019":     "'",
-		"\u2022":     "-",
-		"\u2026":     "...",
-		"\u2028":     "",
-		"\u2033":     "\"",
-		"\u2034":     "\"",
-		"\u2035":     "'",
-		"\u2036":     "\"",
-		"\u2037":     "\"",
-		"\u2038":     ".",
-		"\u2044":     "/",
-		"\u201a":     ",",
-		"\u201b":     "'",
-		"\u201c":     "\"",
-		"\u201d":     "\"",
-		"\u201e":     "\"",
-		"\u201f":     "\"",
-		"\u2122":     "",
-		"\u2600":     "",
-		"\u263a":     "",
-		"\u26fa":     "",
-		"\u27a2":     ">",
-		"\ufe0f":     "",
-		"\xa0":       " ",
-		"\xa2":       "",
-		"\xae":       "",
-		"\xbd":       "",
-		"\xde":       "",
-		"\xe2":       "",
-		"\xe9":       "",
-		"\xfc":       "u",
-		"\U0001f44c": "",
-		"\U0001f44d": "",
-		"\U0001f642": "",
-		"\U0001f601": "",
-		"\U0001f690": "",
-		"\U0001f334": "",
-		"\U0001f3dd": "",
-		"\U0001f3fd": "",
-		"\U0001f3d6": "",
-		"\U0001f3a3": "",
-		"\U0001f525": "", // flame
-		"\U0001f60a": "", // smiley
-	}
-
-	// Scan the string replacing all characters in the map
-	newText := ""
-	for _, c := range text {
-		newC, ok := charMap[string(c)]
-		// If not found, use the original
-		if !ok {
-			newC = string(c)
-		}
-		newText = newText + newC
-	}
-	text = newText
-
-	if len(text) > maxLength {
-		return text[0:maxLength-3] + "..."
-	}
-
-	// Remove any emojis (this is my own addition to the gist mentioned at the top in the comment)
-	// and then get rid of any accents finally
-	return removeAccents(gomoji.RemoveEmojis(text))
-}
-
-// isUpper is a utility function to check if a string is all upper-case
-// Below two functions from https://stackoverflow.com/a/59293875
-// Strange that not already in standard library, but maybe I missed it ...
-// Returns true if all runes in string are upper-case letters
-func isUpper(s string) bool {
-	for _, r := range s {
-		if !unicode.IsUpper(r) && unicode.IsLetter(r) {
-			return false
-		}
-	}
-	return true
-}
-
-// getCwd is a utility function to return current working directory
-func getCwd() string {
-	ex, err := os.Executable()
-	checkErr(err)
-	return filepath.Dir(ex)
-}
-
-// createTablesIfNotExist creates our SQLite db and tables if they do not exist
-func createTablesIfNotExist() {
-	createPodcasts := `
-	CREATE TABLE IF NOT EXISTS podcasts (
-		title TEXT PRIMARY KEY,
-		author TEXT,
-		description TEXT,
-		language TEXT,
-		link TEXT,
-		category TEXT,
-		first_seen TEXT NOT NULL,
-		last_seen TEXT NOT NULL
-	);
-	`
-
-	createEpisodes := `
-	CREATE TABLE IF NOT EXISTS episodes (
-		author TEXT,
-		description TEXT,
-		episode INTEGER,
-		file TEXT,
-		format TEXT,
-		guid TEXT,
-		link TEXT,
-		published TEXT,
-		title TEXT,
-		updated TEXT,
-		-- these are our own internally-generated data
-		first_seen TEXT,
-		last_seen TEXT,
-		podcast_title TEXT, -- we will join on this
-		podcastname_episodename_hash TEXT PRIMARY KEY,
-		file_url_hash TEXT
-	);
-	`
-
-	createDownloaded := `
-	CREATE TABLE IF NOT EXISTS downloads (
-		filename TEXT PRIMARY KEY,
-		hash TEXT NOT NULL,
-		first_seen TEXT NOT NULL,
-		last_seen TEXT NOT NULL,
-		tagged_at TEXT DEFAULT NULL
-	);
-	`
-
-	db, err := sql.Open(sqlite3, dbFileName)
-	checkErr(err)
-
-	if err == nil {
-		defer db.Close()
-
-		statement, err := db.Prepare(createPodcasts)
-		checkErr(err)
-		_, err = statement.Exec()
-		checkErr(err)
-
-		statement, err = db.Prepare(createEpisodes)
-		checkErr(err)
-		_, err = statement.Exec()
-		checkErr(err)
-
-		statement, err = db.Prepare(createEpisodes)
-		checkErr(err)
-		_, err = statement.Exec()
-		checkErr(err)
-
-		statement, err = db.Prepare(createDownloaded)
-		checkErr(err)
-		_, err = statement.Exec()
-		checkErr(err)
-	}
-}
-
-// podEpisodesIntoDatabase adds the podcast metadata to the db
-func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
-
-	// For the podcast
-	// 1. Is it in the db?
-	//   If yes then update the last seen timestamp
-	//   If no then add it to the db
-
-	db, err := sql.Open(sqlite3, dbFileName)
-	checkErr(err)
-	if err == nil {
-		defer db.Close()
-	}
-
-	// 1. Is it in the db?
-	rows, err := db.Query(`
-		SELECT count(*) AS COUNT
-		FROM podcasts
-		WHERE podcasts.title=?
-		;`, pod[title])
-	checkErr(err)
-
-	var count int
-	for rows.Next() {
-		err = rows.Scan(&count)
-		checkErr(err)
-	}
-
-	if count > 1 {
-		l.Fatalln(pod[title], "is in the db more than once, this should not happen")
-	}
-
-	//   If yes then update the last seen timestamp
-	if count == 1 {
-		if verbose {
-			l.Println(pod[title], "is already in the db")
-		}
-
-		stmt, err := db.Prepare(`
-			UPDATE podcasts
-			SET last_seen = ?
-			WHERE title = ?
-			;`)
-		checkErr(err)
-
-		res, err := stmt.Exec(ts, pod[title])
-		checkErr(err)
-
-		affected, err := res.RowsAffected()
-		checkErr(err)
-
-		if verbose {
-			l.Println(affected, "rows updated (last_seen)")
-		}
-	}
-
-	//   If no then add it to the db
-	if count == 0 {
-		l.Println(pod[title], "is not in the db and seems to be a new podcast, adding")
-
-		stmt, err := db.Prepare(`
-			INSERT INTO podcasts
-			(author, category, description, language, link, title, first_seen, last_seen)
-			VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?)
-			;`)
-		checkErr(err)
-
-		// We wrap these because we don't want empty strings in the db ideally
-		res, err := stmt.Exec(
-			nullWrap(pod[author]),
-			nullWrap(pod[category]),
-			nullWrap(pod[description]),
-			nullWrap(pod[language_]),
-			nullWrap(pod[link]),
-			nullWrap(pod[title]),
-			ts,
-			ts,
-		)
-		checkErr(err)
-
-		idx, err := res.LastInsertId()
-		checkErr(err)
-		if verbose {
-			l.Println("insert id for podcast", pod[title], "is", idx)
-		}
-	}
-
-	// For the episodes
-	// Is it in the db?
-	//   If yes then update the last seen timestamp
-	//   If no then add it to the db
-
-	for idx := range episodes {
-		// Do some type conversion map[string]interface{} to map[string]string
-		ep := make(map[string]string)
-
-		for k, v := range episodes[idx] {
-			ep[k] = v.(string)
-		}
-
-		podcastNameEpisodeName := pod[title] + ep[title]
-		podcastNameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastNameEpisodeName)))
-		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep[file])))
-
-		// Is it in the db?
-		rows, err := db.Query(`
-			SELECT count(*) AS COUNT
-			FROM episodes
-			WHERE podcastname_episodename_hash=?
-			;`, podcastNameEpisodenameHash)
-		checkErr(err)
-
-		var count int
-		for rows.Next() {
-			err = rows.Scan(&count)
-			checkErr(err)
-		}
-
-		if count > 1 {
-			l.Fatalln(ep[title], "is in the db more than once, this should not happen")
-		}
-
-		if count == 1 {
-			if verbose {
-				l.Println(ep[title], "is already in the db")
-			}
-
-			stmt, err := db.Prepare(`
-				UPDATE episodes
-				SET last_seen = ?
-				WHERE title = ?
-				;`)
-			checkErr(err)
-
-			res, err := stmt.Exec(ts, ep[title])
-			checkErr(err)
-
-			affected, err := res.RowsAffected()
-			checkErr(err)
-
-			if verbose {
-				l.Println(affected, "rows updated (last_seen)")
-			}
-		}
-
-		if count == 0 {
-			stmt, err := db.Prepare(`
-				INSERT INTO episodes (
-					author, description, episode,
-					file, format, guid,
-					link, published, title,
-					updated, first_seen, last_seen,
-					podcast_title, podcastname_episodename_hash, file_url_hash
-				) VALUES (
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?
-				);`)
-			checkErr(err)
-
-			// Make sure description does not contain HTML
-			nonHtmlDesc := strip.StripTags(ep[description])
-			ep[description] = nonHtmlDesc
-
-			// From author ... updated are just the keys in the episode map
-			if verbose {
-				l.Println(ep)
-			}
-
-			res, err := stmt.Exec(
-				nullWrap(ep[author]),
-				nullWrap(ep[description]),
-				nullWrap(ep[episode]),
-				nullWrap(ep[file]),
-				nullWrap(ep[format]),
-				nullWrap(ep[guid]),
-				nullWrap(ep[link]),
-				nullWrap(ep[published]),
-				nullWrap(ep[title]),
-				nullWrap(ep[updated]),
-				ts,
-				ts,
-				nullWrap(pod[title]),
-				podcastNameEpisodenameHash,
-				fileUrlHash,
-			)
-			checkErr(err)
-
-			idx, err := res.LastInsertId()
-			checkErr(err)
-			if verbose {
-				l.Println("insert id for episode", ep[title], "is", idx)
-			}
-		}
-	}
-}
-
 // readConfig is a function which reads the configuration file and return slices with URLs for RSS files
 func readConfig(confFilePath string) ([]string, error) {
-	content, err := ioutil.ReadFile(confFilePath)
+	content, err := os.ReadFile(confFilePath)
 	validated := []string{}
 
 	if !errors.Is(err, os.ErrNotExist) {
-		l.Println("Configuration file at " + confFilePath + " exists")
+		log.Println("Configuration file at " + confFilePath + " exists")
 	}
 
 	if err != nil {
@@ -672,187 +85,14 @@ func readConfig(confFilePath string) ([]string, error) {
 	if verbose {
 		fmt.Printf("Feed URLs from config file %s:\n%s\n", confFilePath, strings.Join(validated, "\n"))
 	}
-	l.Printf("%d valid URLs\n", len(validated))
+	log.Printf("%d valid URLs\n", len(validated))
 
 	return validated, nil
 }
 
-// parseFeed a function to to parse an individual RSS feed
-func parseFeed(url string) (map[string]string, []M, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	// Will throw the item maps in here
-	var sItems []M
-	pod := make(map[string]string)
-
-	l.Println("Parsing " + url)
-	fp := gofeed.NewParser()
-
-	fp.Client = &http.Client{
-		// Extend the timeout a bit. See also: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
-		Timeout: 60 * time.Second,
-		// Allow various ciphers. See also: https://github.com/golang/go/issues/44267#issuecomment-819278575
-		Transport: &http.Transport{
-			TLSHandshakeTimeout: 10 * time.Second,
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, // Go 1.8 only
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,   // Go 1.8 only
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				},
-			},
-		}}
-
-	// Change the user agent to something that looks like Chrome/Brave
-	fp.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-
-	feed, err := fp.ParseURLWithContext(url, ctx)
-
-	// If there is an error parsing the feed then return with the error
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Podcast metadata
-	if len(feed.Authors) == 1 {
-		pod[author] = strings.TrimSpace(feed.Authors[0].Name)
-	} else {
-		if len(feed.Authors) == 0 {
-			// No authors
-			if verbose {
-				l.Println("No authors")
-			}
-		} else {
-			l.Println("More than one author")
-			l.Println(feed.Authors)
-		}
-	}
-
-	pod[title] = strings.TrimSpace(feed.Title)
-	pod[link] = strings.TrimSpace(feed.Link)
-	pod[description] = strings.TrimSpace(feed.Description)
-	pod[language_] = strings.TrimSpace(feed.Language)
-	pod[category] = strings.TrimSpace(strings.Join(feed.Categories, ", "))
-
-	// Episodes metadata
-	for idx := range feed.Items {
-		item := feed.Items[idx]
-
-		// Looks like:
-		//
-		// type Item struct {
-		//     Title           string                   `json:"title,omitempty"`
-		//     Description     string                   `json:"description,omitempty"`
-		//     Content         string                   `json:"content,omitempty"`
-		//     Link            string                   `json:"link,omitempty"`
-		//     Links           []string                 `json:"links,omitempty"`
-		//     Updated         string                   `json:"updated,omitempty"`
-		//     UpdatedParsed   *time.Time               `json:"updatedParsed,omitempty"`
-		//     Published       string                   `json:"published,omitempty"`
-		//     PublishedParsed *time.Time               `json:"publishedParsed,omitempty"`
-		//     Author          *Person                  `json:"author,omitempty"` // Deprecated
-		//     Authors         []*Person                `json:"authors,omitempty"`
-		//     GUID            string                   `json:"guid,omitempty"`
-		//     Image           *Image                   `json:"image,omitempty"`
-		//     Categories      []string                 `json:"categories,omitempty"`
-		//     Enclosures      []*Enclosure             `json:"enclosures,omitempty"`
-		//     DublinCoreExt   *ext.DublinCoreExtension `json:"dcExt,omitempty"`
-		//     ITunesExt       *ext.ITunesItemExtension `json:"itunesExt,omitempty"`
-		//     Extensions      ext.Extensions           `json:"extensions,omitempty"`
-		//     Custom          map[string]string        `json:"custom,omitempty"`
-		// }
-
-		// We want:
-		//
-		//    "title", "language", "itunes:author", "feed_url", "link", "description",
-		//    "itunes:summary", "itunes:explicit", "enclosure"
-
-		i := make(M)
-
-		i[title] = strings.TrimSpace(item.Title)
-
-		// Potential addition: use itunes:author if missing
-		// Potential addition: Loop through for authors and handle >1
-		if len(item.Authors) == 1 {
-			i[author] = strings.TrimSpace(item.Authors[0].Name)
-		} else {
-			if len(item.Authors) == 0 {
-				// No authors
-				i[author] = ""
-			} else {
-				l.Println("More than one author")
-				l.Println(item.Authors)
-			}
-		}
-
-		i[link] = strings.TrimSpace(item.Link)
-		i[description] = strings.TrimSpace(item.Description)
-		i[guid] = strings.TrimSpace(item.GUID)
-
-		// Change anything time.Time into a string
-		// this is buffer value
-		var t time.Time
-
-		if item.UpdatedParsed != nil {
-			t = *item.UpdatedParsed
-			i[updated] = t.Format(time.RFC3339)
-		} else {
-			i[updated] = ""
-		}
-
-		if item.PublishedParsed != nil {
-			t = *item.PublishedParsed
-			i[published] = t.Format(time.RFC3339)
-		} else {
-			i[published] = ""
-		}
-
-		// Assumes only one enclosure
-		if len(item.Enclosures) == 1 {
-			i[file] = strings.TrimSpace(item.Enclosures[0].URL)
-			i[format] = strings.TrimSpace(item.Enclosures[0].Type)
-		} else {
-			if len(item.Enclosures) == 0 {
-				// Enclosures is empty
-			} else {
-				// If it's not empty and more than one then log
-				l.Println("More than one enclosure")
-				l.Println(item.Enclosures)
-			}
-		}
-
-		// iTunes extension to spec (not always present)
-		if item.ITunesExt != nil {
-			// If author is an empty string (i.e. false) then use the iTunes author
-			if i[author] == "" {
-				i[author] = strings.TrimSpace(item.ITunesExt.Author)
-			}
-
-			// Pick up itunes episode while we are at in
-			i[episode] = strings.TrimSpace(item.ITunesExt.Episode)
-
-			// If desc is empty use itunes summary
-			if i[description] == "" {
-				i[description] = strings.TrimSpace(item.ITunesExt.Summary)
-			}
-		} else {
-			// Set episode to empty string if we have not picked it up
-			i[episode] = ""
-		}
-
-		sItems = append(sItems, i)
-	}
-
-	return pod, sItems, err
-}
-
 // hashFromFilename returns the hash part from the filename
 // we can then compare this hash to what is in the db
+// TODO: add example filename
 func hashFromFilename(filename string) (string, string) {
 	parsedA := strings.ReplaceAll(filename, ".", "-")
 	parsedB := strings.Split(parsedA, "-")
@@ -1032,7 +272,7 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 		fmt.Printf("%s (%s) (db hash %s)\n", title, tTitle, hash)
 
 		if len([]rune(tTitle)) == 0 {
-			l.Fatal("No tTitle")
+			log.Fatal("No tTitle")
 		}
 
 		counter += 1
@@ -1046,56 +286,11 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	return inDbNotInFileSet
 }
 
-// titleTransformation takes a podcast title and transforms it (removing spaces etc)
-// so it can sensibly be used in the podcast filename
-func titleTransformation(s string) string {
-
-	// Reflect strings.Title functionality; strings.Title is deprecated
-	caser := cases.Title(language.English)
-
-	// Get rid of any quotation characters
-	var sC string
-	sA := strings.ReplaceAll(s, "\"", "")
-	sB := strings.ReplaceAll(sA, "'", "")
-
-	// Make the string less than 100 runes if it is more than that
-	if len(sB) > 100 {
-		sC = sB[:100]
-	} else {
-		sC = sB
-	}
-
-	// Get the words and join them together with _
-	regexS := `[A-Za-z]+`
-	re := regexp.MustCompile(regexS)
-	strSlice := re.FindAllStringSubmatch(sC, -1)
-
-	newStr := make([]string, 0)
-
-	for _, v := range strSlice {
-		s := v[0]
-		// If the word is all upper case make it title case
-		if isUpper(s) {
-			buff := caser.String(strings.ToLower(s))
-			newStr = append(newStr, buff)
-		} else {
-			newStr = append(newStr, s)
-		}
-	}
-
-	return strings.Join(newStr, "_")
-}
-
-// genScriptLine generate our wget shell command give a URL and filename
-func genScriptLine(url string, filename string) string {
-	return fmt.Sprintf("wget --no-clobber --continue --no-check-certificate --no-verbose '%s' -O '%s' && chmod 666 '%s'", url, filename, filename)
-}
-
 // generateDownloadList generates download script based on the pods to download
 func generateDownloadList(podcastsDir string) {
 	hashes := seeWhatPodsWeAlreadyHave(dbFileName, podcastsDir)
 
-	l.Println("Pods for download are")
+	log.Println("Pods for download are")
 
 	// Some entries have no associated file
 	// e.g. RSS feed for Risky Talk podcast includes transcripts where the file tag is empty
@@ -1163,28 +358,29 @@ func generateDownloadList(podcastsDir string) {
 	linesJoined := strings.Join(lines, "\n")
 
 	// Potential addition: permissions should probably be narrower
-	err = ioutil.WriteFile(filename, []byte(linesJoined), 0666)
+	err = os.WriteFile(filename, []byte(linesJoined), 0666)
 	checkErr(err)
 
-	l.Printf("Written script to %s", filename)
+	log.Printf("Written script to %s", filename)
 }
 
-// runEyeD3 runs the eyeD3 command to strip tags from the mp3 file
-func runEyeD3(filename string, pythonPath string, eyeD3Path string) {
+// stripTagsWithEyeD3 runs the eyeD3 command to strip tags from the mp3 file
+func stripTagsWithEyeD3(filename string, pythonInterpreterPath string, eyeD3Path string) {
+	// string with path to 'binary'
 	t := eyeD3Path + "/" + eyeD3
 	eyeD3Path = t
 
-	fmt.Printf("Using: %s %s %s\n", pythonPath, eyeD3Path, filename)
+	fmt.Printf("Using: %s %s %s\n", pythonInterpreterPath, eyeD3Path, filename)
 
 	fmt.Printf("Reading with %s:", eyeD3)
-	cmd := exec.Command(pythonPath, eyeD3Path, filename)
+	cmd := exec.Command(pythonInterpreterPath, eyeD3Path, filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	checkErr(err)
 
 	fmt.Printf("Removing tags with %s:", eyeD3)
-	cmd = exec.Command(pythonPath, eyeD3Path, "--remove-all", filename)
+	cmd = exec.Command(pythonInterpreterPath, eyeD3Path, "--remove-all", filename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
@@ -1206,109 +402,21 @@ func runDownloadScript(podcasts_dir string) {
 	checkErr(err)
 }
 
-// updateDatabaseForDownloads updates the db to record the pods downloaded as downloaded
-func updateDatabaseForDownloads() {
-	cwd := getCwd()
-	fmt.Printf("Note: updating db with downloaded files in %s\n", cwd)
-
-	// Get files
-	files := sensibleFilesInDir(cwd).ToSlice()
-
-	// Open db
-	db, err := sql.Open(sqlite3, dbFileName)
-	checkErr(err)
-
-	if err == nil {
-		defer db.Close()
-	}
-
-	// Update or insert as appropriate
-	for _, file := range files {
-
-		// See if it's in already
-		rows, err := db.Query(`
-			SELECT count(*) AS COUNT
-			FROM downloads
-			WHERE filename = ?
-			;`, file)
-		checkErr(err)
-
-		// If it is, update last_seen
-		var count int
-		for rows.Next() {
-			err = rows.Scan(&count)
-			checkErr(err)
-		}
-
-		if count > 1 {
-			l.Fatalln(file, "is in the db more than once, this should not happen")
-		}
-
-		// If yes then update the last seen timestamp
-		if count == 1 {
-			stmt, err := db.Prepare(`
-				UPDATE downloads 
-				SET last_seen = ?
-				WHERE filename = ?
-				;`)
-			checkErr(err)
-
-			res, err := stmt.Exec(ts, file)
-			checkErr(err)
-
-			affected, err := res.RowsAffected()
-			checkErr(err)
-
-			if verbose {
-				l.Println(affected, "rows updated (last_seen)")
-			}
-		}
-
-		//   If no then add it to the db
-		if count == 0 {
-			l.Println(file, "is not in the db and seems to be a fresh download, adding")
-
-			// Get the hash from the filename
-			hash, _ := hashFromFilename(file.(string))
-
-			stmt, err := db.Prepare(`
-				INSERT INTO downloads
-				(filename, hash, first_seen, last_seen)
-				VALUES
-				(?, ?, ?, ?)
-				;`)
-			checkErr(err)
-
-			// We wrap these because we don't want empty strings in the db ideally
-			res, err := stmt.Exec(file, hash, ts, ts)
-			checkErr(err)
-
-			idx, err := res.LastInsertId()
-			checkErr(err)
-
-			if verbose {
-				l.Println("insert id for podcast download", file, "is", idx)
-			}
-		}
-	}
-
-	// Could check to see if anything has unexpectedly disappeared but this seems pointless hence not done
-}
-
 // tagSinglePod tags the file at filename with the title and album metadata
 func tagSinglePod(filename string, title string, album string) {
+
 	// title tag is title
 	// album is podcast title
-
 	// genre is "Podcast"
 	const genre = "Podcast"
 	var parse bool = true
 
 	tag, err := id3v2.Open(filename, id3v2.Options{Parse: parse})
 
+	// if we fail to open we run eyeD3 to remove any tags and try again
 	if err != nil {
 		fmt.Printf("%s is a file where reading the tags has been problematic %s\n", filename, err)
-		runEyeD3(filename, pythonPath, eyeD3Path)
+		stripTagsWithEyeD3(filename, pythonInterpreterPath, eyeD3Path)
 		parse = false
 		tag, err = id3v2.Open(filename, id3v2.Options{Parse: parse})
 		checkErr(err)
@@ -1396,7 +504,7 @@ func tagThosePods(podcasts_dir string) int {
 		filename := ns_filename.String
 		podcast_title := ns_podcast_title.String
 		title := ns_title.String
-		l.Printf("%s: %s / %s", filename, podcast_title, title)
+		log.Printf("%s: %s / %s", filename, podcast_title, title)
 
 		// Tag 'em
 		tagSinglePod(filename, title, podcast_title)
@@ -1405,7 +513,7 @@ func tagThosePods(podcasts_dir string) int {
 		filenames_set.Add(ns_filename)
 	}
 
-	l.Printf("Been through tagging on %d files", count)
+	log.Printf("Been through tagging on %d files", count)
 
 	if count == 0 {
 		fmt.Println("Did you run -u after downloading with -d ?")
@@ -1425,7 +533,7 @@ func tagThosePods(podcasts_dir string) int {
 			checkErr(err)
 
 			if affected != 1 {
-				l.Fatal("More than one row affected which should not happen")
+				log.Fatal("More than one row affected which should not happen")
 			}
 		}
 
@@ -1456,7 +564,7 @@ func parseThem(conf_file_path string) {
 // we use this to set up the logger and some globals
 func init() {
 	// logger
-	l = log.New(os.Stdout, os.Args[0]+" ", log.LstdFlags|log.Lshortfile)
+	log = logger.New(os.Stdout, os.Args[0]+" ", logger.LstdFlags|logger.Lshortfile)
 
 	// this is our timestamp
 	ts = time.Now().Format(time.RFC3339)
@@ -1477,21 +585,7 @@ func cwdCheck(cwd string) {
 	}
 }
 
-type latestPodResult struct {
-	author        sql.NullString
-	title         sql.NullString
-	published     sql.NullString
-	podcast_title sql.NullString
-}
-
-func nullStrToStr(s sql.NullString) string {
-	if s.Valid {
-		return s.String
-	} else {
-		return "?"
-	}
-}
-
+// latestPodsFromDb lists the latest pods from the db
 func latestPodsFromDb(path string) {
 	// TODO: other places should also take into account the full path to the db
 	// rather than assuming it will be in cwd/same place as the binary
@@ -1566,6 +660,8 @@ func main() {
 
 	// Parse command line arguments
 
+	// TODO: we should check for eyeD3 and wget availability
+	// and update our help output accordingly
 	// This is our help message with %s placeholders
 	helpMessage := `
 Incrementally download and tag podcasts. Requires wget and eyeD3
@@ -1620,18 +716,18 @@ Note:
 	}
 
 	if parseOptPtr == nil || seeOptPtr == nil {
-		l.Fatal("Some issue with argparse")
+		log.Fatal("Some issue with argparse")
 	}
 
 	// Given we know we have gone past the help message now let's
 	// warn people if we are using defaults
 	tmp_fmt := "%s is not set; using default, value is %s\n"
 	if !confVarIsSet {
-		l.Printf(tmp_fmt, confVarEnvName, confFilePath)
+		log.Printf(tmp_fmt, confVarEnvName, confFilePath)
 	}
 
 	if !pathVarIsSet {
-		l.Printf(tmp_fmt, pathVarEnvName, podcastsDir)
+		log.Printf(tmp_fmt, pathVarEnvName, podcastsDir)
 	}
 
 	// Check we have dependencies and get python path
@@ -1639,16 +735,16 @@ Note:
 
 	// Set globals
 	// TODO: globals should be refactored out
-	pythonPath = python
+	pythonInterpreterPath = python
 	eyeD3Path = eyeD3Dir
 
-	l.Printf("Have dependencies: %t", haveDependancies)
-	l.Printf("python path is %s", pythonPath)
-	l.Printf("eyeD3 folder is %s", eyeD3Path)
+	log.Printf("Have dependencies: %t", haveDependancies)
+	log.Printf("python path is %s", pythonInterpreterPath)
+	log.Printf("eyeD3 folder is %s", eyeD3Path)
 
 	// If we don't have dependencies then we exit
 	if !haveDependancies {
-		l.Fatal("Exiting as we do not have dependancies")
+		log.Fatal("Exiting as we do not have dependancies")
 	}
 
 	cwd := getCwd()
