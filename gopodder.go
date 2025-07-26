@@ -46,22 +46,42 @@ const mp3 = "mp3"
 const eyeD3 = "eyeD3"
 
 // These globals will be set in init()
-var log *logger.Logger // Logger
-var ts string          // This will be starting timestamp
+// Log
+var log *logger.Logger
+
+// This will be starting timestamp
+var ts string
+
+// These will be set to cwd if not explicitly set
 var confFilePathDefault string
 var podcastsDirDefault string
-var verbose bool = false // Verbosity. TODO: this should use the logger and loglevels
-var cwd string           // Current working directory
+
+// Verbosity. TODO: this should use the logger and loglevels
+var verbose bool = false
+
+// Current working directory so we don't have to call it more than once
+var cwd string
 
 // TODO: Should refactor so these are not globals
+
+// Where python binary is
 var pythonInterpreterPath string
+
+// Where eyeD3 is
 var eyeD3Path string
 
-// M is an alias for map[string]interface{}
+// M is an alias for map[string]interface{} for convenience
 type M map[string]interface{}
 
 // readConfig is a function which reads the configuration file and return slices with URLs for RSS files
 func readConfig(confFilePath string) ([]string, error) {
+	/*
+		Our config file is expected to literally just be a list of URLs of RSS files, separated by newlines e.g:
+
+		https://example.com/podcasts/all_pods.rss
+		https://poddist.com/789759379342749/podcasts.rss
+	*/
+
 	content, err := os.ReadFile(confFilePath)
 	validated := []string{}
 
