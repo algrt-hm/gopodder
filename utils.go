@@ -25,14 +25,14 @@ func checkErr(err error) {
 	}
 
 	// we want to print so get the line number
-	_, _, line, _ := runtime.Caller(1)
+	_, file, line, _ := runtime.Caller(1)
 
 	// if a http error then just print it
 	if isHttpError(err) {
-		log.Printf("%s (called from: %d)", err, line)
+		log.Printf("%s (called from: line %d in %s)", err, line, file)
 		// otherwise bork on non-http errors
 	} else {
-		log.Fatalf("%s (called from: %d)", err, line)
+		log.Fatalf("%s (called from: line %d in %s)", err, line, file)
 	}
 }
 
