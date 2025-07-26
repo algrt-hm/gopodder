@@ -26,6 +26,16 @@ func nullStrToStr(s sql.NullString) string {
 	}
 }
 
+// checkStr does a bit of validation on strings
+func checkStr(str string, nameOfStr string) {
+	// The title needs to have string length after stripping of at least 3 characters otherwise we bail
+	strLen := len(strings.TrimSpace(str))
+
+	if strLen < 3 {
+		log.Fatalf("%s of %s (len %v) doesn't seem sensible, bailing", nameOfStr, str, strLen)
+	}
+}
+
 // nullWrap is a utility function to convert a string to NullString if empty
 // Lifted from: https://stackoverflow.com/questions/40266633/golang-insert-null-into-sql-instead-of-empty-string
 func nullWrap(s string) sql.NullString {
@@ -41,6 +51,11 @@ func nullWrap(s string) sql.NullString {
 
 // createTablesIfNotExist creates our SQLite db and tables if they do not exist
 func createTablesIfNotExist() {
+	/*
+		select * from podcasts where title is null;
+		select * from episodes where podcast_title is null;
+	*/
+
 	createPodcasts := `
 	CREATE TABLE IF NOT EXISTS podcasts (
 		title TEXT PRIMARY KEY,
@@ -169,8 +184,11 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		}
 	}
 
-	//   If no then add it to the db
+	// If no then add it to the db
 	if count == 0 {
+		// Check the title isn't nonsense
+		checkStr(pod[title], title)
+
 		log.Println(pod[title], "is not in the db and seems to be a new podcast, adding")
 
 		stmt, err := db.Prepare(`
@@ -260,6 +278,9 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		}
 
 		if count == 0 {
+			// Let's do some validation here so we don't put garbage in the database
+			checkStr(pod[title], title)
+
 			stmt, err := db.Prepare(`
 				INSERT INTO episodes (
 					author, description, episode,

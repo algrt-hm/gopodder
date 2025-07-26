@@ -20,46 +20,13 @@ func isHttpError(err error) bool {
 	return strings.Contains(err.Error(), "http error")
 }
 
-// parseFeed a function to to parse an individual RSS feed
-func parseFeed(url string) (map[string]string, []M, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+// parseLogic is the feed parsing logic
+func parseLogic(feed *gofeed.Feed) (map[string]string, []M, error) {
 
 	// Will throw the item maps in here
 	var sItems []M
 	pod := make(map[string]string)
-
-	log.Println("Parsing " + url)
-	fp := gofeed.NewParser()
-
-	fp.Client = &http.Client{
-		// Extend the timeout a bit. See also: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
-		Timeout: 60 * time.Second,
-		// Allow various ciphers. See also: https://github.com/golang/go/issues/44267#issuecomment-819278575
-		Transport: &http.Transport{
-			TLSHandshakeTimeout: 10 * time.Second,
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, // Go 1.8 only
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,   // Go 1.8 only
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				},
-			},
-		}}
-
-	// Change the user agent to something that looks like Chrome/Brave
-	fp.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-
-	feed, err := fp.ParseURLWithContext(url, ctx)
-
-	// If there is an error parsing the feed then return with the error
-	if err != nil {
-		return nil, nil, err
-	}
+	var err error = nil
 
 	// Podcast metadata
 	if len(feed.Authors) == 1 {
@@ -192,4 +159,44 @@ func parseFeed(url string) (map[string]string, []M, error) {
 	}
 
 	return pod, sItems, err
+}
+
+// parseFeed a function to to parse an individual RSS feed
+func parseFeed(url string) (map[string]string, []M, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	log.Println("Parsing " + url)
+	fp := gofeed.NewParser()
+
+	fp.Client = &http.Client{
+		// Extend the timeout a bit. See also: https://github.com/mmcdole/gofeed/issues/83#issuecomment-355485788
+		Timeout: 60 * time.Second,
+		// Allow various ciphers. See also: https://github.com/golang/go/issues/44267#issuecomment-819278575
+		Transport: &http.Transport{
+			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, // Go 1.8 only
+					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,   // Go 1.8 only
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				},
+			},
+		}}
+
+	// Change the user agent to something that looks like Chrome/Brave
+	fp.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+
+	feed, err := fp.ParseURLWithContext(url, ctx)
+
+	// If there is an error parsing the feed then return with the error
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return parseLogic(feed)
 }
