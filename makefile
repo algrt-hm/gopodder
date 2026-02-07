@@ -10,14 +10,14 @@ format:
 dev:
 	go test -timeout 30s -run ^TestParseLogic
 
-# TODO
-test: clean $(name)
-#	go test -timeout 30s -run ^TestLastestPodsFromDb$$ gopodder
-#	go test -timeout 30s -run ^TestCheckDependencies$$ gopodder
-	echo 'nothing'
+test:
+	go test ./...
 
 build:
 	go build -o $(name) *.go
+
+interactive: build
+	./$(name) --interactive
 
 clean:
 	rm ./$(name)

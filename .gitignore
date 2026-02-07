@@ -2,6 +2,8 @@ deploy.sh
 Untitled.ipynb
 .*check*
 *mp3
+AGENTS.md
+NEW_FEATURE.md
 gopodder.conf
 download_pods.sh
 gopodder.sqlite
