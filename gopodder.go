@@ -695,8 +695,9 @@ Typical use:
 
 	-a will do each of the above in order
 
-Utility:
+	Utility:
 	-l will list the (up to) 100 latest podcasts from the db
+	-i will launch interactive mode (no db writes)
 
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
@@ -720,6 +721,7 @@ Note:
 	doAll := parser.Flag("a", "all", &argparse.Options{Required: false, Help: "Same as -psdut"})
 	verboseOpt := parser.Flag("v", "verbose", &argparse.Options{Required: false, Help: "Verbose"})
 	listLatestPods := parser.Flag("l", "list", &argparse.Options{Required: false, Help: "List latest pods"})
+	interactiveMode := parser.Flag("i", "interactive", &argparse.Options{Required: false, Help: "Interactive episode picker"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -765,6 +767,14 @@ Note:
 	// If we don't have dependencies then we exit
 	if !haveDependancies {
 		log.Fatal("Exiting as we do not have dependancies")
+	}
+
+	// Interactive mode is exclusive and should not touch the database
+	if *interactiveMode {
+		if err := runInteractive(podcastsDir); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	cwd := getCwd()

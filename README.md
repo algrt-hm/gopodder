@@ -75,3 +75,17 @@ GOPODCONF=`pwd` GOPODDIR=`pwd` ./gopodder -a >> pods.log 2>&1
 ``` none
 https://lexfridman.com/feed/podcast/
 ```
+
+### Interactive mode
+
+Use interactive mode to pick and download individual episodes without editing `gopodder.conf`.
+
+``` shell
+./gopodder --interactive
+```
+
+Behavior:
+- If `$GOPODDIR/gopodder-extra.conf` exists, you can pick a feed from that file (one URL per line). Press `m` to enter a URL manually instead.
+- Otherwise, you will be prompted for a feed URL.
+- The UI lists episodes (most recent first). It starts with the latest 10 and you can press `a` to expand to the full list.
+- Select episodes with Space, then choose a destination folder. Downloads happen immediately and mp3 tags are written (uses `wget` and `eyeD3`).
