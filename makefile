@@ -7,9 +7,6 @@ all: build
 format:
 	go fmt *.go
 
-dev:
-	go test -timeout 30s -run ^TestParseLogic
-
 test:
 	go test ./...
 
@@ -18,6 +15,11 @@ build:
 
 interactive: build
 	./$(name) --interactive
+
+DEV_GOPODDIR ?= /mnt/titanium/new_podcasts
+
+dev: build
+	GOPODDIR=$(DEV_GOPODDIR) ./$(name) --interactive
 
 clean:
 	rm ./$(name)
