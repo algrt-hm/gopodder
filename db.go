@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	strip "github.com/grokify/html-strip-tags-go" // Lift of stripTags from html/template package
@@ -90,6 +91,31 @@ func createTablesIfNotExist() {
 	);
 	`
 
+	createInteractiveEpisodes := `
+	CREATE TABLE IF NOT EXISTS interactive_episodes (
+		author TEXT,
+		description TEXT,
+		episode INTEGER,
+		file TEXT,
+		format TEXT,
+		guid TEXT,
+		link TEXT,
+		published TEXT,
+		title TEXT,
+		updated TEXT,
+		first_seen TEXT NOT NULL,
+		last_seen TEXT NOT NULL,
+		podcast_title TEXT NOT NULL,
+		podcastname_episodename_hash TEXT PRIMARY KEY,
+		file_url_hash TEXT
+	);
+	`
+
+	createInteractiveEpisodesPodcastIdx := `
+	CREATE INDEX IF NOT EXISTS idx_interactive_episodes_podcast_title
+	ON interactive_episodes (podcast_title);
+	`
+
 	createDownloaded := `
 	CREATE TABLE IF NOT EXISTS downloads (
 		filename TEXT PRIMARY KEY,
@@ -116,7 +142,12 @@ func createTablesIfNotExist() {
 		_, err = statement.Exec()
 		checkErr(err)
 
-		statement, err = db.Prepare(createEpisodes)
+		statement, err = db.Prepare(createInteractiveEpisodes)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
+		statement, err = db.Prepare(createInteractiveEpisodesPodcastIdx)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
@@ -236,6 +267,9 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		podcastNameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastNameEpisodeName)))
 		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep[file])))
 
+		// Make sure description does not contain HTML
+		ep[description] = strip.StripTags(ep[description])
+
 		// Is it in the db?
 		rows, err := db.Query(`
 			SELECT count(*) AS COUNT
@@ -297,10 +331,6 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				);`)
 			checkErr(err)
 
-			// Make sure description does not contain HTML
-			nonHtmlDesc := strip.StripTags(ep[description])
-			ep[description] = nonHtmlDesc
-
 			// From author ... updated are just the keys in the episode map
 			if verbose {
 				log.Println(ep)
@@ -331,7 +361,158 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				log.Println("insert id for episode", ep[title], "is", idx)
 			}
 		}
+
+		err = upsertInteractiveEpisodeRecord(db, pod[title], ep, podcastNameEpisodenameHash, fileUrlHash)
+		checkErr(err)
 	}
+}
+
+func upsertInteractiveEpisodeRecord(db *sql.DB, podTitle string, ep map[string]string, podcastNameEpisodenameHash string, fileUrlHash string) error {
+	stmt, err := db.Prepare(`
+		INSERT INTO interactive_episodes (
+			author, description, episode,
+			file, format, guid,
+			link, published, title,
+			updated, first_seen, last_seen,
+			podcast_title, podcastname_episodename_hash, file_url_hash
+		) VALUES (
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?
+		)
+		ON CONFLICT(podcastname_episodename_hash) DO UPDATE SET
+			author = excluded.author,
+			description = excluded.description,
+			episode = excluded.episode,
+			file = excluded.file,
+			format = excluded.format,
+			guid = excluded.guid,
+			link = excluded.link,
+			published = excluded.published,
+			title = excluded.title,
+			updated = excluded.updated,
+			podcast_title = excluded.podcast_title,
+			file_url_hash = excluded.file_url_hash,
+			last_seen = excluded.last_seen
+		;`)
+	if err != nil {
+		return err
+	}
+
+	_, err = stmt.Exec(
+		nullWrap(ep[author]),
+		nullWrap(ep[description]),
+		nullWrap(ep[episode]),
+		nullWrap(ep[file]),
+		nullWrap(ep[format]),
+		nullWrap(ep[guid]),
+		nullWrap(ep[link]),
+		nullWrap(ep[published]),
+		nullWrap(ep[title]),
+		nullWrap(ep[updated]),
+		ts,
+		ts,
+		podTitle,
+		podcastNameEpisodenameHash,
+		fileUrlHash,
+	)
+	return err
+}
+
+func storeParsedFeedInInteractiveTable(pod map[string]string, episodes []M) error {
+	podTitle := strings.TrimSpace(pod[title])
+	if podTitle == "" {
+		return fmt.Errorf("podcast title is empty")
+	}
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	for idx := range episodes {
+		ep := make(map[string]string)
+		for key, value := range episodes[idx] {
+			if value == nil {
+				ep[key] = ""
+				continue
+			}
+			strVal, ok := value.(string)
+			if !ok {
+				ep[key] = ""
+				continue
+			}
+			ep[key] = strVal
+		}
+
+		podcastNameEpisodeName := podTitle + ep[title]
+		podcastNameEpisodenameHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastNameEpisodeName)))
+		fileUrlHash := fmt.Sprintf("%x", md5.Sum([]byte(ep[file])))
+		ep[description] = strip.StripTags(ep[description])
+
+		err = upsertInteractiveEpisodeRecord(db, podTitle, ep, podcastNameEpisodenameHash, fileUrlHash)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func recordInteractiveDownload(downloadPath string) error {
+	filename := strings.TrimSpace(filepath.Base(downloadPath))
+	if filename == "" {
+		return fmt.Errorf("download path does not contain a filename")
+	}
+
+	hash, err := hashFromDownloadFilename(filename)
+	if err != nil {
+		return err
+	}
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		INSERT INTO downloads
+		(filename, hash, first_seen, last_seen, tagged_at)
+		VALUES
+		(?, ?, ?, ?, ?)
+		ON CONFLICT(filename) DO UPDATE SET
+			hash = excluded.hash,
+			last_seen = excluded.last_seen,
+			tagged_at = excluded.tagged_at
+		;`,
+		filename,
+		hash,
+		ts,
+		ts,
+		ts,
+	)
+	return err
+}
+
+func hashFromDownloadFilename(filename string) (string, error) {
+	parsedA := strings.ReplaceAll(filename, ".", "-")
+	parsedB := strings.Split(parsedA, "-")
+	nParsedB := len(parsedB)
+
+	if nParsedB < 2 {
+		return "", fmt.Errorf("unexpected filename format: %s", filename)
+	}
+
+	hash := strings.TrimSpace(parsedB[nParsedB-2 : nParsedB-1][0])
+	if hash == "" {
+		return "", fmt.Errorf("missing hash in filename: %s", filename)
+	}
+
+	return hash, nil
 }
 
 // updateDatabaseForDownloads updates the db to record the pods downloaded as downloaded

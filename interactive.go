@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -17,6 +20,7 @@ import (
 
 const initialListLimit = 10
 const extraConfName = "gopodder-extra.conf"
+const downloadOutputLimit = 12
 
 // runInteractive launches the Bubble Tea UI and downloads selected episodes.
 func runInteractive(defaultFolder string) error {
@@ -65,29 +69,38 @@ type downloadResultMsg struct {
 	err      error
 }
 
+type downloadOutputMsg struct {
+	line string
+	done bool
+}
+
 type interactiveModel struct {
-	step        interactiveStep
-	urlInput    textinput.Model
-	folderInput textinput.Model
-	feedFile    string
-	feedOptions []string
-	feedCursor  int
-	feedOffset  int
-	podTitle    string
-	items       []episodeItem
-	cursor      int
-	viewOffset  int
-	windowSize  int
-	showAll     bool
-	skipped     int
-	errMsg      string
-	outPath     string
-	outputCount int
-	downloadIdx int
-	downloadTo  string
-	downloadSet []episodeItem
-	downloadErr []string
-	downloadOK  int
+	step               interactiveStep
+	urlInput           textinput.Model
+	folderInput        textinput.Model
+	feedFile           string
+	feedOptions        []string
+	feedOptionsAreURLs bool
+	feedCursor         int
+	feedOffset         int
+	podTitle           string
+	items              []episodeItem
+	cursor             int
+	viewOffset         int
+	windowSize         int
+	showAll            bool
+	skipped            int
+	errMsg             string
+	outPath            string
+	outputCount        int
+	downloadIdx        int
+	downloadTo         string
+	downloadSet        []episodeItem
+	downloadErr        []string
+	downloadOK         int
+	downloadOKFiles    []string
+	downloadOut        []string
+	downloadCh         chan string
 }
 
 func newInteractiveModel(defaultFolder string) interactiveModel {
@@ -110,14 +123,28 @@ func newInteractiveModel(defaultFolder string) interactiveModel {
 		windowSize:  10,
 	}
 
-	feedFile, feedOptions, err, exists := loadExtraFeeds(defaultFolder)
-	if exists && err == nil && len(feedOptions) > 0 {
+	dbTitles, err := loadPodcastTitlesFromDatabase()
+	if err == nil && len(dbTitles) > 0 {
+		model.step = stepFeedSelect
+		model.feedFile = dbFileName
+		model.feedOptions = dbTitles
+		model.feedOptionsAreURLs = false
+		return model
+	}
+	if err != nil {
+		model.errMsg = fmt.Sprintf("Failed to read podcast titles from %s; enter URL manually.", dbFileName)
+	}
+
+	feedFile, feedOptions, feedErr, exists := loadExtraFeeds(defaultFolder)
+	if exists && feedErr == nil && len(feedOptions) > 0 {
 		model.step = stepFeedSelect
 		model.feedFile = feedFile
 		model.feedOptions = feedOptions
-	} else if exists {
+		model.feedOptionsAreURLs = true
+		model.errMsg = ""
+	} else if exists && model.errMsg == "" {
 		model.feedFile = feedFile
-		if err != nil {
+		if feedErr != nil {
 			model.errMsg = fmt.Sprintf("Failed to read %s; enter URL manually.", feedFile)
 		} else {
 			model.errMsg = fmt.Sprintf("No valid URLs in %s; enter URL manually.", feedFile)
@@ -206,17 +233,24 @@ func (m interactiveModel) updateFeedSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if len(m.feedOptions) == 0 {
-				m.errMsg = "No feeds available."
+				m.errMsg = "No podcasts available."
 				return m, nil
 			}
-			url := strings.TrimSpace(m.feedOptions[m.feedCursor])
-			if url == "" {
-				m.errMsg = "Selected feed is empty."
+			selected := strings.TrimSpace(m.feedOptions[m.feedCursor])
+			if selected == "" {
+				if m.feedOptionsAreURLs {
+					m.errMsg = "Selected feed is empty."
+				} else {
+					m.errMsg = "Selected podcast title is empty."
+				}
 				return m, nil
 			}
 			m.errMsg = ""
 			m.step = stepLoading
-			return m, fetchFeedCmd(url)
+			if m.feedOptionsAreURLs {
+				return m, fetchFeedCmd(selected)
+			}
+			return m, loadEpisodesForPodcastCmd(selected)
 		case "m":
 			m.step = stepURL
 			m.urlInput.Focus()
@@ -235,7 +269,11 @@ func (m interactiveModel) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case feedParsedMsg:
 		if msg.err != nil {
-			m.errMsg = fmt.Sprintf("Failed to parse feed: %v", msg.err)
+			m.errMsg = fmt.Sprintf("Failed to load episodes: %v", msg.err)
+			if len(m.feedOptions) > 0 {
+				m.step = stepFeedSelect
+				return m, nil
+			}
 			m.step = stepURL
 			return m, nil
 		}
@@ -296,6 +334,11 @@ func (m interactiveModel) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.folderInput.Focus()
 			return m, nil
 		case "b", "esc":
+			if len(m.feedOptions) > 0 {
+				m.step = stepFeedSelect
+				m.ensureFeedVisible()
+				return m, nil
+			}
 			m.step = stepURL
 			m.urlInput.Focus()
 			return m, nil
@@ -340,13 +383,19 @@ func (m interactiveModel) updateFolder(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.downloadIdx = 0
 			m.downloadOK = 0
 			m.downloadErr = nil
+			m.downloadOKFiles = nil
+			m.downloadOut = nil
+			m.downloadCh = make(chan string, 200)
 			if len(m.downloadSet) == 0 {
 				m.errMsg = "Select at least one episode."
 				m.step = stepSelect
 				return m, nil
 			}
 
-			return m, downloadEpisodeCmd(folder, m.podTitle, m.downloadSet[0], 0)
+			return m, tea.Batch(
+				downloadEpisodeCmd(folder, m.podTitle, m.downloadSet[0], 0, m.downloadCh),
+				listenForDownloadOutput(m.downloadCh),
+			)
 		}
 	}
 
@@ -370,6 +419,7 @@ func (m interactiveModel) updateDownloading(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.downloadErr = append(m.downloadErr, fmt.Sprintf("%s: %v", msg.filename, msg.err))
 		} else {
 			m.downloadOK++
+			m.downloadOKFiles = append(m.downloadOKFiles, msg.filename)
 		}
 
 		m.downloadIdx++
@@ -380,7 +430,27 @@ func (m interactiveModel) updateDownloading(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		return m, downloadEpisodeCmd(m.downloadTo, m.podTitle, m.downloadSet[m.downloadIdx], m.downloadIdx)
+		m.downloadOut = nil
+		m.downloadCh = make(chan string, 200)
+		return m, tea.Batch(
+			downloadEpisodeCmd(m.downloadTo, m.podTitle, m.downloadSet[m.downloadIdx], m.downloadIdx, m.downloadCh),
+			listenForDownloadOutput(m.downloadCh),
+		)
+	case downloadOutputMsg:
+		if msg.done {
+			return m, nil
+		}
+		line := strings.TrimSpace(msg.line)
+		if line != "" {
+			m.downloadOut = append(m.downloadOut, line)
+			if len(m.downloadOut) > downloadOutputLimit {
+				m.downloadOut = m.downloadOut[len(m.downloadOut)-downloadOutputLimit:]
+			}
+		}
+		if m.downloadCh != nil {
+			return m, listenForDownloadOutput(m.downloadCh)
+		}
+		return m, nil
 	}
 
 	return m, nil
@@ -433,7 +503,11 @@ func (m interactiveModel) viewURL() string {
 		b.WriteString("\n")
 	}
 	if len(m.feedOptions) > 0 {
-		b.WriteString("\nPress b to choose from gopodder-extra.conf.\n")
+		if m.feedOptionsAreURLs {
+			b.WriteString("\nPress b to choose from gopodder-extra.conf.\n")
+		} else {
+			b.WriteString("\nPress b to choose a podcast title from the database.\n")
+		}
 	}
 	b.WriteString("\nPress Enter to continue.\n")
 	return b.String()
@@ -441,10 +515,18 @@ func (m interactiveModel) viewURL() string {
 
 func (m interactiveModel) viewFeedSelect() string {
 	var b strings.Builder
-	b.WriteString("Select a feed (gopodder-extra.conf)\n")
-	if m.feedFile != "" {
-		b.WriteString(m.feedFile)
-		b.WriteString("\n")
+	if m.feedOptionsAreURLs {
+		b.WriteString("Select a feed (gopodder-extra.conf)\n")
+		if m.feedFile != "" {
+			b.WriteString(m.feedFile)
+			b.WriteString("\n")
+		}
+	} else {
+		b.WriteString("Select a podcast\n")
+		b.WriteString(fmt.Sprintf("Source: %s (database)\n", dbFileName))
+		if len(m.feedOptions) > 0 {
+			b.WriteString(fmt.Sprintf("%d podcasts available\n", len(m.feedOptions)))
+		}
 	}
 	b.WriteString("\n")
 
@@ -454,18 +536,18 @@ func (m interactiveModel) viewFeedSelect() string {
 	}
 
 	if len(m.feedOptions) == 0 {
-		b.WriteString("No feeds available. Press m to enter a URL manually.\n")
+		b.WriteString("No podcasts available. Press m to enter a URL manually.\n")
 		return b.String()
 	}
 
 	start, end := m.feedVisibleRange()
 	for i := start; i < end; i++ {
-		feed := m.feedOptions[i]
+		option := m.feedOptions[i]
 		cursor := " "
 		if i == m.feedCursor {
 			cursor = ">"
 		}
-		b.WriteString(fmt.Sprintf("%s %s\n", cursor, feed))
+		b.WriteString(fmt.Sprintf("%s %s\n", cursor, option))
 	}
 
 	b.WriteString("\nEnter: select  m: manual URL  q: quit\n")
@@ -473,7 +555,7 @@ func (m interactiveModel) viewFeedSelect() string {
 }
 
 func (m interactiveModel) viewLoading() string {
-	return "Loading feed...\n"
+	return "Loading episodes...\n"
 }
 
 func (m interactiveModel) viewSelect() string {
@@ -492,7 +574,7 @@ func (m interactiveModel) viewSelect() string {
 	}
 
 	if len(m.items) == 0 {
-		b.WriteString("No items available. Press b to change URL or q to quit.\n")
+		b.WriteString("No items available. Press b to choose another podcast or q to quit.\n")
 		return b.String()
 	}
 
@@ -673,6 +755,19 @@ func (m interactiveModel) viewDownloading() string {
 	b.WriteString(fmt.Sprintf("Downloading %d of %d\n\n", current, total))
 	b.WriteString(item.title)
 	b.WriteString("\n")
+	if len(m.downloadOKFiles) > 0 {
+		last := m.downloadOKFiles[len(m.downloadOKFiles)-1]
+		b.WriteString("\nLast downloaded:\n")
+		b.WriteString(last)
+		b.WriteString("\n")
+	}
+	if len(m.downloadOut) > 0 {
+		b.WriteString("\nWget output:\n")
+		for _, line := range m.downloadOut {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
 	if len(m.downloadErr) > 0 {
 		b.WriteString("\nErrors so far:\n")
 		for _, msg := range m.downloadErr {
@@ -688,6 +783,13 @@ func (m interactiveModel) viewDone() string {
 	b.WriteString("Done.\n\n")
 	total := len(m.downloadSet)
 	b.WriteString(fmt.Sprintf("Downloaded %d of %d episodes to %s\n", m.outputCount, total, m.outPath))
+	if len(m.downloadOKFiles) > 0 {
+		b.WriteString("\nDownloaded files:\n")
+		for _, file := range m.downloadOKFiles {
+			b.WriteString(file)
+			b.WriteString("\n")
+		}
+	}
 	if len(m.downloadErr) > 0 {
 		b.WriteString("\nErrors:\n")
 		for _, msg := range m.downloadErr {
@@ -725,6 +827,9 @@ func fetchFeedCmd(url string) tea.Cmd {
 		if err != nil {
 			return feedParsedMsg{err: err}
 		}
+		if err := storeParsedFeedInInteractiveTable(pod, episodes); err != nil {
+			return feedParsedMsg{err: fmt.Errorf("failed to store parsed feed in database: %w", err)}
+		}
 
 		items, skipped := buildEpisodeItems(pod, episodes)
 		return feedParsedMsg{
@@ -734,6 +839,131 @@ func fetchFeedCmd(url string) tea.Cmd {
 			err:      nil,
 		}
 	}
+}
+
+func loadEpisodesForPodcastCmd(podcastTitle string) tea.Cmd {
+	return func() tea.Msg {
+		items, err := loadEpisodeItemsFromDatabase(podcastTitle)
+		if err != nil {
+			return feedParsedMsg{err: err}
+		}
+		return feedParsedMsg{
+			podTitle: podcastTitle,
+			episodes: items,
+			skipped:  0,
+			err:      nil,
+		}
+	}
+}
+
+func loadPodcastTitlesFromDatabase() ([]string, error) {
+	if _, err := os.Stat(dbFileName); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`
+		SELECT DISTINCT podcast_title
+		FROM interactive_episodes
+		WHERE podcast_title IS NOT NULL AND TRIM(podcast_title) != ''
+		ORDER BY LOWER(podcast_title);
+	`)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	titles := make([]string, 0)
+	for rows.Next() {
+		var podcastTitle string
+		if err := rows.Scan(&podcastTitle); err != nil {
+			return nil, err
+		}
+		podcastTitle = strings.TrimSpace(podcastTitle)
+		if podcastTitle != "" {
+			titles = append(titles, podcastTitle)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return titles, nil
+}
+
+func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`
+		SELECT
+			COALESCE(title, ''),
+			COALESCE(published, ''),
+			COALESCE(updated, ''),
+			COALESCE(file, ''),
+			COALESCE(podcastname_episodename_hash, '')
+		FROM interactive_episodes
+		WHERE podcast_title = ?
+			AND file IS NOT NULL
+			AND TRIM(file) != ''
+		ORDER BY COALESCE(published, updated, first_seen) DESC;
+	`, podcastTitle)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]episodeItem, 0)
+	now := time.Now()
+	for rows.Next() {
+		var titleStr, publishedStr, updatedStr, fileURL, hash string
+		if err := rows.Scan(&titleStr, &publishedStr, &updatedStr, &fileURL, &hash); err != nil {
+			return nil, err
+		}
+
+		titleStr = strings.TrimSpace(titleStr)
+		fileURL = strings.TrimSpace(fileURL)
+		if fileURL == "" {
+			continue
+		}
+
+		timestamp := episodeTimestamp(strings.TrimSpace(publishedStr), strings.TrimSpace(updatedStr), now)
+		dateStr := timestamp.Format("2006-01-02")
+		filename := buildEpisodeFilenameWithHash(podcastTitle, titleStr, dateStr, strings.TrimSpace(hash))
+
+		items = append(items, episodeItem{
+			title:    titleStr,
+			date:     timestamp,
+			dateStr:  dateStr,
+			url:      fileURL,
+			filename: filename,
+			selected: false,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].date.After(items[j].date)
+	})
+
+	return items, nil
 }
 
 func buildEpisodeItems(pod map[string]string, episodes []M) ([]episodeItem, int) {
@@ -774,14 +1004,28 @@ func buildEpisodeItems(pod map[string]string, episodes []M) ([]episodeItem, int)
 }
 
 func buildEpisodeFilename(podcastTitle, episodeTitle, dateStr string) string {
+	podcastHash := fmt.Sprintf("%x", md5.Sum([]byte(strings.TrimSpace(podcastTitle)+strings.TrimSpace(episodeTitle))))
+	return buildEpisodeFilenameWithHash(podcastTitle, episodeTitle, dateStr, podcastHash)
+}
+
+func buildEpisodeFilenameWithHash(podcastTitle, episodeTitle, dateStr, podcastHash string) string {
 	podcastTitle = strings.TrimSpace(podcastTitle)
 	episodeTitle = strings.TrimSpace(episodeTitle)
 
-	podcastHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+episodeTitle)))
+	if podcastHash == "" {
+		podcastHash = fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+episodeTitle)))
+	}
+
 	transformedPodcastTitle := titleTransformation(podcastTitle)
 	transformedTitle := titleTransformation(episodeTitle)
 
-	return fmt.Sprintf("%s-%s-%s-%s.%s", transformedPodcastTitle, dateStr, transformedTitle, podcastHash, mp3)
+	return fmt.Sprintf("%s-%s-%s-%s.%s",
+		transformedPodcastTitle,
+		dateStr,
+		transformedTitle,
+		podcastHash,
+		mp3,
+	)
 }
 
 func episodeTimestamp(publishedStr, updatedStr string, fallback time.Time) time.Time {
@@ -810,33 +1054,89 @@ func getMapString(m M, key string) string {
 	return str
 }
 
-func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int) tea.Cmd {
+func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int, outputCh chan string) tea.Cmd {
 	return func() tea.Msg {
+		defer close(outputCh)
+
 		filename := filepath.Join(folder, item.filename)
+		if info, err := os.Stat(filename); err == nil && !info.IsDir() {
+			return downloadResultMsg{index: index, filename: filename, err: fmt.Errorf("file already exists, skipping")}
+		} else if err != nil && !os.IsNotExist(err) {
+			return downloadResultMsg{index: index, filename: filename, err: err}
+		}
+
 		cmd := exec.Command(
 			"wget",
 			"--no-clobber",
 			"--continue",
 			"--no-check-certificate",
-			"--no-verbose",
+			"--progress=dot:giga",
 			item.url,
 			"-O",
 			filename,
 		)
-		output, err := cmd.CombinedOutput()
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return downloadResultMsg{index: index, filename: filename, err: err}
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return downloadResultMsg{index: index, filename: filename, err: err}
+		}
+
+		if err := cmd.Start(); err != nil {
+			return downloadResultMsg{index: index, filename: filename, err: err}
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go scanOutputLines(stdout, outputCh, &wg)
+		go scanOutputLines(stderr, outputCh, &wg)
+
+		err = cmd.Wait()
+		wg.Wait()
 		if err == nil {
 			err = os.Chmod(filename, 0666)
 		}
 		if err == nil {
 			tagSinglePod(filename, item.title, podTitle)
 		}
-		if err != nil {
-			trimmed := strings.TrimSpace(string(output))
-			if trimmed != "" {
-				err = fmt.Errorf("%w\n%s", err, trimmed)
+		if err == nil {
+			if dbErr := recordInteractiveDownload(filename); dbErr != nil {
+				err = fmt.Errorf("downloaded and tagged, but failed to update downloads table: %w", dbErr)
 			}
 		}
 		return downloadResultMsg{index: index, filename: filename, err: err}
+	}
+}
+
+func listenForDownloadOutput(ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return downloadOutputMsg{done: true}
+		}
+		return downloadOutputMsg{line: line}
+	}
+}
+
+func scanOutputLines(r io.Reader, ch chan<- string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		select {
+		case ch <- line:
+		default:
+			// Drop output to avoid blocking the download if buffer fills.
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		select {
+		case ch <- fmt.Sprintf("output error: %v", err):
+		default:
+		}
 	}
 }
 

@@ -85,7 +85,12 @@ Use interactive mode to pick and download individual episodes without editing `g
 ```
 
 Behavior:
-- If `$GOPODDIR/gopodder-extra.conf` exists, you can pick a feed from that file (one URL per line). Press `m` to enter a URL manually instead.
-- Otherwise, you will be prompted for a feed URL.
+- Interactive mode first tries to load podcast titles from `gopodder.sqlite` (`interactive_episodes` table), and you pick by podcast title.
+- If the DB has no interactive podcast rows yet, it falls back to `$GOPODDIR/gopodder-extra.conf` (one URL per line), and then to manual URL entry.
+- Press `m` to enter a URL manually.
+- When a feed URL is selected in interactive mode, its parsed podcast/episode metadata is written into `interactive_episodes`, so next runs can show that podcast by title.
 - The UI lists episodes (most recent first). It starts with the latest 10 and you can press `a` to expand to the full list.
 - Select episodes with Space, then choose a destination folder. Downloads happen immediately and mp3 tags are written (uses `wget` and `eyeD3`).
+- Successful interactive downloads are also recorded in the `downloads` table.
+
+Note: the `interactive_episodes` table is populated during feed parsing (`-p` / `-a`); existing `episodes` rows are not backfilled automatically.

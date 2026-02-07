@@ -697,7 +697,7 @@ Typical use:
 
 	Utility:
 	-l will list the (up to) 100 latest podcasts from the db
-	-i will launch interactive mode (no db writes)
+	-i will launch interactive mode
 
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
@@ -769,7 +769,10 @@ Note:
 		log.Fatal("Exiting as we do not have dependancies")
 	}
 
-	// Interactive mode is exclusive and should not touch the database
+	// First let's get the tables ready to go and create them if not
+	createTablesIfNotExist()
+
+	// Interactive mode is exclusive from the parse/script pipeline
 	if *interactiveMode {
 		if err := runInteractive(podcastsDir); err != nil {
 			log.Fatal(err)
@@ -782,9 +785,6 @@ Note:
 		// If we are downloading we make sure we are not downloading into home or similar
 		cwdCheck(cwd)
 	}
-
-	// First let's get the tables ready to go and create them if not
-	createTablesIfNotExist()
 
 	if *doAll {
 		parseThem(confFilePath)
