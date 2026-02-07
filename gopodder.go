@@ -340,12 +340,7 @@ func generateDownloadList(podcastsDir string) {
 
 		// If file_url_hash in hashes ...
 		if hashes.Contains(fileUrlHash) {
-			transformedTitle := titleTransformation(title)
-			transformedPodcastTitle := titleTransformation(podcastTitle)
-			shortDateA := []rune(published)
-			shortDate := string(shortDateA[:10])
-
-			newFilename := fmt.Sprintf("%s-%s-%s-%s.%s", transformedPodcastTitle, shortDate, transformedTitle, podcastNameEpisodenameHash, mp3)
+			newFilename := buildNonInteractiveFilename(podcastTitle, title, published, podcastNameEpisodenameHash)
 			filenames = append(filenames, newFilename)
 			urls = append(urls, file)
 		}
@@ -382,6 +377,12 @@ func generateDownloadList(podcastsDir string) {
 	checkErr(err)
 
 	log.Printf("Written script to %s", filename)
+}
+
+func buildNonInteractiveFilename(podcastTitle, episodeTitle, publishedOrFirstSeen, podcastHash string) string {
+	shortDateA := []rune(publishedOrFirstSeen)
+	shortDate := string(shortDateA[:10])
+	return buildEpisodeFilenameWithHash(podcastTitle, episodeTitle, shortDate, podcastHash)
 }
 
 // stripTagsWithEyeD3 runs the eyeD3 command to strip tags from the mp3 file

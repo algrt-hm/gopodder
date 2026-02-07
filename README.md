@@ -94,3 +94,8 @@ Behavior:
 - Successful interactive downloads are also recorded in the `downloads` table.
 
 Note: the `interactive_episodes` table is populated during feed parsing (`-p` / `-a`); existing `episodes` rows are not backfilled automatically.
+
+### To install dependencies
+
+- MacOS: `brew install eye-d3`
+- Linux (Debian-based): `sudo apt install eyed3`

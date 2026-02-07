@@ -18,6 +18,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+/*
+Note: we want the hashing in interactive mode to be the same as the hashing in the main mode
+
+We are aiming for the filename treatment to be the same in both modes, such that the same podcast would result in the same filename in both modes.
+*/
+
 const initialListLimit = 10
 const extraConfName = "gopodder-extra.conf"
 const downloadOutputLimit = 12
@@ -831,7 +837,18 @@ func fetchFeedCmd(url string) tea.Cmd {
 			return feedParsedMsg{err: fmt.Errorf("failed to store parsed feed in database: %w", err)}
 		}
 
-		items, skipped := buildEpisodeItems(pod, episodes)
+		skipped := 0
+		for _, ep := range episodes {
+			fileURL := strings.TrimSpace(getMapString(ep, file))
+			if fileURL == "" {
+				skipped++
+			}
+		}
+
+		items, err := loadEpisodeItemsFromDatabase(pod[title])
+		if err != nil {
+			return feedParsedMsg{err: err}
+		}
 		return feedParsedMsg{
 			podTitle: pod[title],
 			episodes: items,
@@ -911,16 +928,18 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 
 	rows, err := db.Query(`
 		SELECT
-			COALESCE(title, ''),
-			COALESCE(published, ''),
-			COALESCE(updated, ''),
-			COALESCE(file, ''),
-			COALESCE(podcastname_episodename_hash, '')
-		FROM interactive_episodes
-		WHERE podcast_title = ?
-			AND file IS NOT NULL
-			AND TRIM(file) != ''
-		ORDER BY COALESCE(published, updated, first_seen) DESC;
+			COALESCE(i.title, ''),
+			COALESCE(i.published, ''),
+			COALESCE(e.first_seen, i.first_seen, ''),
+			COALESCE(i.file, ''),
+			COALESCE(i.podcastname_episodename_hash, '')
+		FROM interactive_episodes AS i
+		LEFT JOIN episodes AS e
+			ON e.podcastname_episodename_hash = i.podcastname_episodename_hash
+		WHERE i.podcast_title = ?
+			AND i.file IS NOT NULL
+			AND TRIM(i.file) != ''
+		ORDER BY COALESCE(i.published, e.first_seen, i.first_seen) DESC;
 	`, podcastTitle)
 	if err != nil {
 		return nil, err
@@ -930,8 +949,8 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 	items := make([]episodeItem, 0)
 	now := time.Now()
 	for rows.Next() {
-		var titleStr, publishedStr, updatedStr, fileURL, hash string
-		if err := rows.Scan(&titleStr, &publishedStr, &updatedStr, &fileURL, &hash); err != nil {
+		var titleStr, publishedStr, firstSeenStr, fileURL, hash string
+		if err := rows.Scan(&titleStr, &publishedStr, &firstSeenStr, &fileURL, &hash); err != nil {
 			return nil, err
 		}
 
@@ -941,7 +960,7 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 			continue
 		}
 
-		timestamp := episodeTimestamp(strings.TrimSpace(publishedStr), strings.TrimSpace(updatedStr), now)
+		timestamp := episodeTimestamp(strings.TrimSpace(publishedStr), strings.TrimSpace(firstSeenStr), now)
 		dateStr := timestamp.Format("2006-01-02")
 		filename := buildEpisodeFilenameWithHash(podcastTitle, titleStr, dateStr, strings.TrimSpace(hash))
 
@@ -981,8 +1000,8 @@ func buildEpisodeItems(pod map[string]string, episodes []M) ([]episodeItem, int)
 
 		name := strings.TrimSpace(getMapString(ep, title))
 		pub := strings.TrimSpace(getMapString(ep, published))
-		upd := strings.TrimSpace(getMapString(ep, updated))
-		timestamp := episodeTimestamp(pub, upd, now)
+		firstSeen := strings.TrimSpace(ts)
+		timestamp := episodeTimestamp(pub, firstSeen, now)
 		dateStr := timestamp.Format("2006-01-02")
 
 		filename := buildEpisodeFilename(podTitle, name, dateStr)
@@ -1028,14 +1047,14 @@ func buildEpisodeFilenameWithHash(podcastTitle, episodeTitle, dateStr, podcastHa
 	)
 }
 
-func episodeTimestamp(publishedStr, updatedStr string, fallback time.Time) time.Time {
+func episodeTimestamp(publishedStr, firstSeenStr string, fallback time.Time) time.Time {
 	if publishedStr != "" {
 		if t, err := time.Parse(time.RFC3339, publishedStr); err == nil {
 			return t
 		}
 	}
-	if updatedStr != "" {
-		if t, err := time.Parse(time.RFC3339, updatedStr); err == nil {
+	if firstSeenStr != "" {
+		if t, err := time.Parse(time.RFC3339, firstSeenStr); err == nil {
 			return t
 		}
 	}
