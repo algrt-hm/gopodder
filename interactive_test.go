@@ -14,9 +14,9 @@ import (
 func TestEpisodeTimestamp(t *testing.T) {
 	now := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
 	published := "2024-01-02T10:11:12Z"
-	updated := "2024-02-03T01:02:03Z"
+	firstSeen := "2024-02-03T01:02:03Z"
 
-	got := episodeTimestamp(published, updated, now)
+	got := episodeTimestamp(published, firstSeen, now)
 	want, err := time.Parse(time.RFC3339, published)
 	if err != nil {
 		t.Fatalf("parse published: %v", err)
@@ -25,10 +25,10 @@ func TestEpisodeTimestamp(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 
-	got = episodeTimestamp("", updated, now)
-	want, err = time.Parse(time.RFC3339, updated)
+	got = episodeTimestamp("", firstSeen, now)
+	want, err = time.Parse(time.RFC3339, firstSeen)
 	if err != nil {
-		t.Fatalf("parse updated: %v", err)
+		t.Fatalf("parse firstSeen: %v", err)
 	}
 	if !got.Equal(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -258,6 +258,77 @@ func TestLoadEpisodeItemsFromDatabase(t *testing.T) {
 	}
 	if !strings.HasSuffix(items[0].filename, "-hash-latest.mp3") {
 		t.Fatalf("expected filename to use db hash, got %q", items[0].filename)
+	}
+}
+
+func TestLoadEpisodeItemsUsesEpisodesFirstSeen(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	_ = tmpDir
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podTitle := "DB Podcast"
+	episodeTitle := "No Published"
+	fileURL := "https://example.com/no-pub.mp3"
+	hash := "hash-no-published"
+	fileURLHash := "fhash-no-published"
+	interactiveFirstSeen := "2024-02-01T01:02:03Z"
+	episodesFirstSeen := "2024-01-05T10:11:12Z"
+
+	_, err = db.Exec(`
+		INSERT INTO interactive_episodes (
+			podcast_title, title, published, file, first_seen, last_seen,
+			podcastname_episodename_hash, file_url_hash
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		podTitle,
+		episodeTitle,
+		"",
+		fileURL,
+		interactiveFirstSeen,
+		interactiveFirstSeen,
+		hash,
+		fileURLHash,
+	)
+	if err != nil {
+		t.Fatalf("insert interactive row: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			podcast_title, title, published, file, first_seen, last_seen,
+			podcastname_episodename_hash, file_url_hash
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		podTitle,
+		episodeTitle,
+		"",
+		fileURL,
+		episodesFirstSeen,
+		episodesFirstSeen,
+		hash,
+		fileURLHash,
+	)
+	if err != nil {
+		t.Fatalf("insert episodes row: %v", err)
+	}
+
+	items, err := loadEpisodeItemsFromDatabase(podTitle)
+	if err != nil {
+		t.Fatalf("loadEpisodeItemsFromDatabase error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d items, want 1", len(items))
+	}
+
+	expectedFilename := buildEpisodeFilenameWithHash(podTitle, episodeTitle, "2024-01-05", hash)
+	if items[0].filename != expectedFilename {
+		t.Fatalf("got filename %q, want %q", items[0].filename, expectedFilename)
 	}
 }
 
