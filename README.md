@@ -50,7 +50,7 @@ sudo apt install golang
 brew install go
 
 # On FreeBSD
-TBD
+pkg install go
 ```
 
 Secondly, `go build`
@@ -102,20 +102,21 @@ Use interactive mode to pick and download individual episodes without editing `g
 
 Behaviour:
 
-- Interactive mode first tries to load podcast titles from `gopodder.sqlite` (`interactive_episodes` table), and you pick by podcast title.
-- If the DB has no interactive podcast rows yet, it falls back to `$GOPODDIR/gopodder-extra.conf` (one URL per line), and then to manual URL entry.
-- Press `m` to enter a URL manually.
-- When a feed URL is selected in interactive mode, its parsed podcast/episode metadata is written into `interactive_episodes`, so next runs can show that podcast by title.
-- The UI lists episodes (most recent first). It starts with the latest 10 and you can press `a` to expand to the full list.
-- Select episodes with Space, then choose a destination folder. Downloads happen immediately and mp3 tags are written (uses `wget` and `eyeD3`).
-- Successful interactive downloads are also recorded in the `downloads` table.
+- Interactive mode first tries to load podcast titles from `gopodder.sqlite` (`interactive_episodes` table), and you pick by podcast title
+- If the DB has no interactive podcast rows yet, it falls back to `$GOPODDIR/gopodder-extra.conf` (one URL per line), and then to manual URL entry
+- Press `m` to enter a URL manually
+- When a feed URL is selected in interactive mode, its parsed podcast/episode metadata is written into `interactive_episodes`, so next runs can show that podcast by title
+- The UI lists episodes (most recent first). It starts with the latest 10 and you can press `a` to expand to the full list
+- Episodes already in the `downloads` table are marked with a `✓`. Press `d` to toggle hiding downloaded episodes
+- Select episodes with Space, then choose a destination folder. Downloads happen immediately and mp3 tags are written (uses `wget` and `eyeD3`)
+- Successful interactive downloads are also recorded in the `downloads` table
 
 Note: the `interactive_episodes` table is populated during feed parsing (`-p` / `-a`); existing `episodes` rows are not backfilled automatically.
 
 ### To install dependencies
 
-- MacOS: `brew install eye-d3`
-- Linux (Debian-based): `sudo apt install eyed3`
+- MacOS: `brew install eye-d3 wget`
+- Linux (Debian-based): `sudo apt install eyed3 wget`
 
 ## Technical
 
@@ -123,12 +124,12 @@ Note: the `interactive_episodes` table is populated during feed parsing (`-p` / 
 
 Database Design (SQLite)
 
-Four tables: podcasts, episodes, interactive_episodes, and downloads.
+Four tables: `podcasts`, `episodes`, `interactive_episodes`, and `downloads`.
 
-- podcasts uses title as the primary key, meaning title changes would create a new record rather than updating.
-- episodes and interactive_episodes are keyed on an MD5 hash of podcast_title + episode_title
-    - The interactive_episodes table duplicates the episodes schema — this redundancy exists to separate batch vs. TUI concerns
-- downloads tracks filenames and tagging status (tagged_at)
+- `podcasts` uses `title` as the primary key, meaning title changes would create a new record rather than updating
+- `episodes` and `interactive_episodes` are keyed on an MD5 hash of `podcast_title` + `episode_title`
+    - The `interactive_episodes` table duplicates the `episodes` schema — this redundancy exists to separate batch vs. TUI concerns
+- `downloads` tracks filenames and tagging status (`tagged_at`)
 - No foreign key constraints exist between tables
 
 ### Dependencies
