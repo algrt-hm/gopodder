@@ -364,8 +364,10 @@ func TestRecordInteractiveDownload(t *testing.T) {
 		t.Fatalf("query downloads row: %v", err)
 	}
 
-	wantHash, transformedTitle := hashFromFilename(baseFilename)
-	_ = transformedTitle
+	wantHash, _, err := hashFromFilename(baseFilename)
+	if err != nil {
+		t.Fatalf("hashFromFilename: %v", err)
+	}
 	if gotFilename != baseFilename {
 		t.Fatalf("got filename %q, want %q", gotFilename, baseFilename)
 	}
@@ -430,6 +432,162 @@ func TestStoreParsedFeedInInteractiveTable(t *testing.T) {
 	}
 	if items[0].title != "Episode One" {
 		t.Fatalf("got episode %q, want Episode One", items[0].title)
+	}
+}
+
+func TestLoadEpisodeItemsDownloadedFlag(t *testing.T) {
+	_ = useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	// Insert two episodes
+	for _, ep := range []struct {
+		title string
+		hash  string
+	}{
+		{"Downloaded Ep", "hash-dl"},
+		{"Not Downloaded Ep", "hash-nodl"},
+	} {
+		_, err := db.Exec(`
+			INSERT INTO interactive_episodes (
+				podcast_title, title, published, file, first_seen, last_seen,
+				podcastname_episodename_hash, file_url_hash
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			;`,
+			"DL Podcast", ep.title, "2024-01-01T01:00:00Z",
+			"https://example.com/"+ep.hash+".mp3",
+			ts, ts, ep.hash, "f"+ep.hash,
+		)
+		if err != nil {
+			t.Fatalf("insert episode: %v", err)
+		}
+	}
+
+	// Record one as downloaded
+	_, err = db.Exec(`
+		INSERT INTO downloads (filename, hash, first_seen, last_seen)
+		VALUES (?, ?, ?, ?)
+		;`, "dl-podcast-2024-01-01-downloaded-ep-hash-dl.mp3", "hash-dl", ts, ts)
+	if err != nil {
+		t.Fatalf("insert download: %v", err)
+	}
+
+	items, err := loadEpisodeItemsFromDatabase("DL Podcast")
+	if err != nil {
+		t.Fatalf("loadEpisodeItemsFromDatabase error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+
+	dlCount := 0
+	noDlCount := 0
+	for _, item := range items {
+		if item.title == "Downloaded Ep" {
+			if !item.downloaded {
+				t.Fatalf("expected Downloaded Ep to have downloaded=true")
+			}
+			dlCount++
+		}
+		if item.title == "Not Downloaded Ep" {
+			if item.downloaded {
+				t.Fatalf("expected Not Downloaded Ep to have downloaded=false")
+			}
+			noDlCount++
+		}
+	}
+	if dlCount != 1 || noDlCount != 1 {
+		t.Fatalf("unexpected item counts: dl=%d, nodl=%d", dlCount, noDlCount)
+	}
+}
+
+func TestRebuildVisibleItems(t *testing.T) {
+	allItems := []episodeItem{
+		{title: "Ep1", filename: "ep1.mp3", downloaded: false},
+		{title: "Ep2", filename: "ep2.mp3", downloaded: true},
+		{title: "Ep3", filename: "ep3.mp3", downloaded: false},
+	}
+	m := interactiveModel{
+		allItems:   allItems,
+		items:      append([]episodeItem{}, allItems...),
+		windowSize: 10,
+	}
+
+	// Without filter, all items visible
+	m.hideDownloaded = false
+	m.rebuildVisibleItems()
+	if len(m.items) != 3 {
+		t.Fatalf("expected 3 visible items, got %d", len(m.items))
+	}
+
+	// Select Ep1 and Ep3 in visible items
+	m.items[0].selected = true
+	m.items[2].selected = true
+
+	// Enable filter
+	m.hideDownloaded = true
+	m.rebuildVisibleItems()
+	if len(m.items) != 2 {
+		t.Fatalf("expected 2 visible items with filter, got %d", len(m.items))
+	}
+	for _, item := range m.items {
+		if item.downloaded {
+			t.Fatalf("downloaded item %q should not be visible", item.title)
+		}
+	}
+
+	// Check selections are preserved
+	ep1Found := false
+	ep3Found := false
+	for _, item := range m.items {
+		if item.title == "Ep1" && item.selected {
+			ep1Found = true
+		}
+		if item.title == "Ep3" && item.selected {
+			ep3Found = true
+		}
+	}
+	if !ep1Found {
+		t.Fatalf("Ep1 selection should be preserved after rebuild")
+	}
+	if !ep3Found {
+		t.Fatalf("Ep3 selection should be preserved after rebuild")
+	}
+
+	// Toggle back, selections preserved in allItems
+	m.hideDownloaded = false
+	m.rebuildVisibleItems()
+	if len(m.items) != 3 {
+		t.Fatalf("expected 3 visible items after unfilter, got %d", len(m.items))
+	}
+	// Verify Ep1 and Ep3 still selected after round-trip
+	for _, item := range m.items {
+		if item.title == "Ep1" && !item.selected {
+			t.Fatalf("Ep1 should still be selected after round-trip")
+		}
+		if item.title == "Ep3" && !item.selected {
+			t.Fatalf("Ep3 should still be selected after round-trip")
+		}
+	}
+}
+
+func TestDownloadedCount(t *testing.T) {
+	m := interactiveModel{
+		allItems: []episodeItem{
+			{title: "A", downloaded: true},
+			{title: "B", downloaded: false},
+			{title: "C", downloaded: true},
+			{title: "D", downloaded: false},
+		},
+	}
+	got := m.downloadedCount()
+	if got != 2 {
+		t.Fatalf("expected downloadedCount()=2, got %d", got)
 	}
 }
 

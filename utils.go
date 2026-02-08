@@ -32,7 +32,7 @@ func checkErr(err error) {
 		log.Printf("%s (called from: line %d in %s)", err, line, file)
 		// otherwise bork on non-http errors
 	} else {
-		log.Fatalf("%s (called from: line %d in %s)", err, line, file)
+		log.Panicf("%s (called from: line %d in %s)", err, line, file)
 	}
 }
 
@@ -90,7 +90,7 @@ func checkDependencies(verbose bool) (bool, string, string) {
 	eyeD3Dir := ""
 
 	if path == "" {
-		log.Fatal("PATH does not seem to be set in environment")
+		log.Panic("PATH does not seem to be set in environment")
 	}
 
 	pathDirs := strings.Split(path, ":")
