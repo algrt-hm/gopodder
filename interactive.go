@@ -29,14 +29,14 @@ const extraConfName = "gopodder-extra.conf"
 const downloadOutputLimit = 12
 
 // runInteractive launches the Bubble Tea UI and downloads selected episodes.
-func runInteractive(defaultFolder string) error {
+func runInteractive(defaultFolder string, pythonPath string, eyeD3Dir string) error {
 	if log != nil {
 		prev := log.Writer()
 		log.SetOutput(io.Discard)
 		defer log.SetOutput(prev)
 	}
 
-	model := newInteractiveModel(defaultFolder)
+	model := newInteractiveModel(defaultFolder, pythonPath, eyeD3Dir)
 	_, err := tea.NewProgram(model).Run()
 	return err
 }
@@ -54,12 +54,13 @@ const (
 )
 
 type episodeItem struct {
-	title    string
-	date     time.Time
-	dateStr  string
-	url      string
-	filename string
-	selected bool
+	title      string
+	date       time.Time
+	dateStr    string
+	url        string
+	filename   string
+	selected   bool
+	downloaded bool
 }
 
 type feedParsedMsg struct {
@@ -91,6 +92,8 @@ type interactiveModel struct {
 	feedOffset         int
 	podTitle           string
 	items              []episodeItem
+	allItems           []episodeItem
+	hideDownloaded     bool
 	cursor             int
 	viewOffset         int
 	windowSize         int
@@ -107,9 +110,11 @@ type interactiveModel struct {
 	downloadOKFiles    []string
 	downloadOut        []string
 	downloadCh         chan string
+	pythonPath         string
+	eyeD3Dir           string
 }
 
-func newInteractiveModel(defaultFolder string) interactiveModel {
+func newInteractiveModel(defaultFolder string, pythonPath string, eyeD3Dir string) interactiveModel {
 	urlInput := textinput.New()
 	urlInput.Placeholder = "https://example.com/feed.rss"
 	urlInput.Focus()
@@ -127,6 +132,8 @@ func newInteractiveModel(defaultFolder string) interactiveModel {
 		urlInput:    urlInput,
 		folderInput: folderInput,
 		windowSize:  10,
+		pythonPath:  pythonPath,
+		eyeD3Dir:    eyeD3Dir,
 	}
 
 	dbTitles, err := loadPodcastTitlesFromDatabase()
@@ -285,14 +292,16 @@ func (m interactiveModel) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.podTitle = msg.podTitle
-		m.items = msg.episodes
+		m.allItems = msg.episodes
 		m.skipped = msg.skipped
 		m.cursor = 0
 		m.viewOffset = 0
 		m.showAll = false
+		m.hideDownloaded = false
 		m.errMsg = ""
+		m.rebuildVisibleItems()
 
-		if len(m.items) == 0 {
+		if len(m.allItems) == 0 {
 			m.errMsg = "No downloadable episodes found."
 		}
 		m.step = stepSelect
@@ -312,18 +321,25 @@ func (m interactiveModel) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "up", "k":
+			m.errMsg = ""
 			if m.cursor > 0 {
 				m.cursor--
 				m.ensureCursorVisible()
 			}
 		case "down", "j":
+			m.errMsg = ""
 			if limit := m.listLimit(); limit > 0 && m.cursor < limit-1 {
 				m.cursor++
 				m.ensureCursorVisible()
 			}
 		case " ":
 			if len(m.items) > 0 {
-				m.items[m.cursor].selected = !m.items[m.cursor].selected
+				if m.items[m.cursor].downloaded {
+					m.errMsg = "Already downloaded. Navigate or press d to dismiss."
+				} else {
+					m.items[m.cursor].selected = !m.items[m.cursor].selected
+					m.errMsg = ""
+				}
 			}
 		case "enter":
 			if len(m.items) == 0 {
@@ -352,6 +368,15 @@ func (m interactiveModel) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.items) > initialListLimit {
 				m.showAll = !m.showAll
 				m.ensureCursorVisible()
+			}
+		case "d":
+			if m.downloadedCount() > 0 {
+				m.hideDownloaded = !m.hideDownloaded
+				m.rebuildVisibleItems()
+				m.errMsg = ""
+				if m.hideDownloaded && len(m.items) == 0 {
+					m.errMsg = "All episodes already downloaded. Press d to show them."
+				}
 			}
 		}
 	}
@@ -399,7 +424,7 @@ func (m interactiveModel) updateFolder(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			return m, tea.Batch(
-				downloadEpisodeCmd(folder, m.podTitle, m.downloadSet[0], 0, m.downloadCh),
+				downloadEpisodeCmd(folder, m.podTitle, m.downloadSet[0], 0, m.downloadCh, m.pythonPath, m.eyeD3Dir),
 				listenForDownloadOutput(m.downloadCh),
 			)
 		}
@@ -439,7 +464,7 @@ func (m interactiveModel) updateDownloading(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.downloadOut = nil
 		m.downloadCh = make(chan string, 200)
 		return m, tea.Batch(
-			downloadEpisodeCmd(m.downloadTo, m.podTitle, m.downloadSet[m.downloadIdx], m.downloadIdx, m.downloadCh),
+			downloadEpisodeCmd(m.downloadTo, m.podTitle, m.downloadSet[m.downloadIdx], m.downloadIdx, m.downloadCh, m.pythonPath, m.eyeD3Dir),
 			listenForDownloadOutput(m.downloadCh),
 		)
 	case downloadOutputMsg:
@@ -580,7 +605,11 @@ func (m interactiveModel) viewSelect() string {
 	}
 
 	if len(m.items) == 0 {
-		b.WriteString("No items available. Press b to choose another podcast or q to quit.\n")
+		if m.hideDownloaded && m.downloadedCount() > 0 {
+			b.WriteString("All episodes already downloaded. Press d to show them.\n")
+		} else {
+			b.WriteString("No items available. Press b to choose another podcast or q to quit.\n")
+		}
 		return b.String()
 	}
 
@@ -595,16 +624,35 @@ func (m interactiveModel) viewSelect() string {
 		if item.selected {
 			check = "x"
 		}
-		b.WriteString(fmt.Sprintf("%s [%s] %s %s\n", cursor, check, item.dateStr, item.title))
+		dlMark := " "
+		if item.downloaded {
+			dlMark = "✓"
+		}
+		b.WriteString(fmt.Sprintf("%s [%s] %s %s %s\n", cursor, check, dlMark, item.dateStr, item.title))
 	}
 
 	b.WriteString("\nSpace: select  Enter: continue  b: back  q: quit")
 	if len(m.items) > initialListLimit {
 		b.WriteString("  a: toggle full list")
 	}
+	if m.downloadedCount() > 0 {
+		if m.hideDownloaded {
+			b.WriteString("  d: show downloaded")
+		} else {
+			b.WriteString("  d: hide downloaded")
+		}
+	}
 	b.WriteString("\n")
 	if m.skipped > 0 {
 		b.WriteString(fmt.Sprintf("Skipped %d items without downloadable audio.\n", m.skipped))
+	}
+	if m.hideDownloaded {
+		hidden := m.downloadedCount()
+		if hidden == 1 {
+			b.WriteString("Hiding 1 downloaded episode.\n")
+		} else {
+			b.WriteString(fmt.Sprintf("Hiding %d downloaded episodes.\n", hidden))
+		}
 	}
 	if len(m.items) > initialListLimit {
 		if m.showAll {
@@ -657,6 +705,47 @@ func (m *interactiveModel) ensureCursorVisible() {
 	if maxOffset := limit - m.windowSize; maxOffset > 0 && m.viewOffset > maxOffset {
 		m.viewOffset = maxOffset
 	}
+}
+
+func (m *interactiveModel) syncSelectionsToAllItems() {
+	selected := make(map[string]bool, len(m.items))
+	for _, item := range m.items {
+		if item.selected {
+			selected[item.filename] = true
+		}
+	}
+	for i := range m.allItems {
+		m.allItems[i].selected = selected[m.allItems[i].filename]
+	}
+}
+
+func (m *interactiveModel) rebuildVisibleItems() {
+	m.syncSelectionsToAllItems()
+	m.items = make([]episodeItem, 0, len(m.allItems))
+	for _, item := range m.allItems {
+		if m.hideDownloaded && item.downloaded {
+			continue
+		}
+		m.items = append(m.items, item)
+	}
+	if m.cursor >= len(m.items) {
+		m.cursor = len(m.items) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	m.viewOffset = 0
+	m.ensureCursorVisible()
+}
+
+func (m interactiveModel) downloadedCount() int {
+	count := 0
+	for _, item := range m.allItems {
+		if item.downloaded {
+			count++
+		}
+	}
+	return count
 }
 
 func (m interactiveModel) visibleRange() (int, int) {
@@ -932,7 +1021,10 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 			COALESCE(i.published, ''),
 			COALESCE(e.first_seen, i.first_seen, ''),
 			COALESCE(i.file, ''),
-			COALESCE(i.podcastname_episodename_hash, '')
+			COALESCE(i.podcastname_episodename_hash, ''),
+			CASE WHEN EXISTS (
+				SELECT 1 FROM downloads AS d WHERE d.hash = i.podcastname_episodename_hash
+			) THEN 1 ELSE 0 END
 		FROM interactive_episodes AS i
 		LEFT JOIN episodes AS e
 			ON e.podcastname_episodename_hash = i.podcastname_episodename_hash
@@ -950,7 +1042,8 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 	now := time.Now()
 	for rows.Next() {
 		var titleStr, publishedStr, firstSeenStr, fileURL, hash string
-		if err := rows.Scan(&titleStr, &publishedStr, &firstSeenStr, &fileURL, &hash); err != nil {
+		var downloadedInt int
+		if err := rows.Scan(&titleStr, &publishedStr, &firstSeenStr, &fileURL, &hash, &downloadedInt); err != nil {
 			return nil, err
 		}
 
@@ -965,12 +1058,13 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 		filename := buildEpisodeFilenameWithHash(podcastTitle, titleStr, dateStr, strings.TrimSpace(hash))
 
 		items = append(items, episodeItem{
-			title:    titleStr,
-			date:     timestamp,
-			dateStr:  dateStr,
-			url:      fileURL,
-			filename: filename,
-			selected: false,
+			title:      titleStr,
+			date:       timestamp,
+			dateStr:    dateStr,
+			url:        fileURL,
+			filename:   filename,
+			selected:   false,
+			downloaded: downloadedInt == 1,
 		})
 	}
 
@@ -1073,7 +1167,7 @@ func getMapString(m M, key string) string {
 	return str
 }
 
-func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int, outputCh chan string) tea.Cmd {
+func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int, outputCh chan string, pythonPath string, eyeD3Dir string) tea.Cmd {
 	return func() tea.Msg {
 		defer close(outputCh)
 
@@ -1119,7 +1213,7 @@ func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int, ou
 			err = os.Chmod(filename, 0666)
 		}
 		if err == nil {
-			tagSinglePod(filename, item.title, podTitle)
+			tagSinglePod(filename, item.title, podTitle, pythonPath, eyeD3Dir)
 		}
 		if err == nil {
 			if dbErr := recordInteractiveDownload(filename); dbErr != nil {

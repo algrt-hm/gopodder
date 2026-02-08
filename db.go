@@ -33,7 +33,7 @@ func checkStr(str string, nameOfStr string) {
 	strLen := len(strings.TrimSpace(str))
 
 	if strLen < 3 {
-		log.Fatalf("%s of %s (len %v) doesn't seem sensible, bailing", nameOfStr, str, strLen)
+		log.Panicf("%s of %s (len %v) doesn't seem sensible, bailing", nameOfStr, str, strLen)
 	}
 }
 
@@ -116,6 +116,16 @@ func createTablesIfNotExist() {
 	ON interactive_episodes (podcast_title);
 	`
 
+	createEpisodesFileUrlHashIdx := `
+	CREATE INDEX IF NOT EXISTS idx_episodes_file_url_hash
+	ON episodes (file_url_hash);
+	`
+
+	createInteractiveEpisodesFileUrlHashIdx := `
+	CREATE INDEX IF NOT EXISTS idx_interactive_episodes_file_url_hash
+	ON interactive_episodes (file_url_hash);
+	`
+
 	createDownloaded := `
 	CREATE TABLE IF NOT EXISTS downloads (
 		filename TEXT PRIMARY KEY,
@@ -152,9 +162,25 @@ func createTablesIfNotExist() {
 		_, err = statement.Exec()
 		checkErr(err)
 
+		statement, err = db.Prepare(createEpisodesFileUrlHashIdx)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
+		statement, err = db.Prepare(createInteractiveEpisodesFileUrlHashIdx)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
 		statement, err = db.Prepare(createDownloaded)
 		checkErr(err)
 		_, err = statement.Exec()
+		checkErr(err)
+
+		// Clean up historical rows with NULL or empty podcast_title
+		_, err = db.Exec(`DELETE FROM episodes WHERE podcast_title IS NULL OR TRIM(podcast_title) = '';`)
+		checkErr(err)
+		_, err = db.Exec(`DELETE FROM interactive_episodes WHERE podcast_title IS NULL OR TRIM(podcast_title) = '';`)
 		checkErr(err)
 	}
 }
@@ -188,7 +214,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 	}
 
 	if count > 1 {
-		log.Fatalln(pod[title], "is in the db more than once, this should not happen")
+		log.Panicln(pod[title], "is in the db more than once, this should not happen")
 	}
 
 	//   If yes then update the last seen timestamp
@@ -260,7 +286,19 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		ep := make(map[string]string)
 
 		for k, v := range episodes[idx] {
-			ep[k] = v.(string)
+			// Below is safer expansion of
+			// ep[k] = v.(string)
+
+			if v == nil {
+				ep[k] = ""
+				continue
+			}
+			strVal, ok := v.(string)
+			if !ok {
+				ep[k] = fmt.Sprintf("%v", v)
+				continue
+			}
+			ep[k] = strVal
 		}
 
 		podcastNameEpisodeName := pod[title] + ep[title]
@@ -285,7 +323,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		}
 
 		if count > 1 {
-			log.Fatalln(ep[title], "is in the db more than once, this should not happen")
+			log.Panicln(ep[title], "is in the db more than once, this should not happen")
 		}
 
 		if count == 1 {
@@ -550,7 +588,7 @@ func updateDatabaseForDownloads() {
 		}
 
 		if count > 1 {
-			log.Fatalln(file, "is in the db more than once, this should not happen")
+			log.Panicln(file, "is in the db more than once, this should not happen")
 		}
 
 		// If yes then update the last seen timestamp
@@ -578,7 +616,13 @@ func updateDatabaseForDownloads() {
 			log.Println(file, "is not in the db and seems to be a fresh download, adding")
 
 			// Get the hash from the filename
-			hash, _ := hashFromFilename(file.(string))
+			fileStr := fmt.Sprintf("%v", file)
+			hash, _, err := hashFromFilename(fileStr)
+			// Skip over error
+			if err != nil {
+				log.Printf("skipping file %s: %v", fileStr, err)
+				continue
+			}
 
 			stmt, err := db.Prepare(`
 				INSERT INTO downloads

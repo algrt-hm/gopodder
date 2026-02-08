@@ -62,14 +62,6 @@ var verbose bool = false
 // Current working directory so we don't have to call it more than once
 var cwd string
 
-// TODO: Should refactor so these are not globals
-
-// Where python binary is
-var pythonInterpreterPath string
-
-// Where eyeD3 is
-var eyeD3Path string
-
 // M is an alias for map[string]interface{} for convenience
 type M map[string]interface{}
 
@@ -110,16 +102,18 @@ func readConfig(confFilePath string) ([]string, error) {
 	return validated, nil
 }
 
-// hashFromFilename returns the hash part from the filename
-// we can then compare this hash to what is in the db
-// TODO: add example filename
-func hashFromFilename(filename string) (string, string) {
+// hashFromFilename returns the hash and transformed title parts from the filename.
+// Example filename: "My_Podcast-2024-01-02-Episode_Title-abc123def.mp3"
+func hashFromFilename(filename string) (string, string, error) {
 	parsedA := strings.ReplaceAll(filename, ".", "-")
 	parsedB := strings.Split(parsedA, "-")
 	nParsedB := len(parsedB)
+	if nParsedB < 3 {
+		return "", "", fmt.Errorf("unexpected filename format (need at least 3 dash-separated parts): %s", filename)
+	}
 	hash := parsedB[nParsedB-2 : nParsedB-1][0]
 	transformedTitle := parsedB[nParsedB-3 : nParsedB-2][0]
-	return hash, transformedTitle
+	return hash, transformedTitle, nil
 }
 
 // sensibleFilesInDir returns a set of filenames that we identify as podcasts
@@ -144,39 +138,45 @@ func sensibleFilesInDir(path string) mapset.Set {
 	return filenamesSet
 }
 
-// seeWhatPodsWeAlreadyHave will check the db against files we already have
-func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
-	filenamesHashSet := mapset.NewSet()
-	dbHashSet := mapset.NewSet()
-	transformedTitlesSet := mapset.NewSet()
-	filenamesSet := mapset.NewSet()
-	hashesToEpInfo := make(map[string]string)
-	transformedTitlesToHashes := make(map[string]string)
-	hashesToTransformedTitles := make(map[string]string)
-	ttsInFileNames := mapset.NewSet()
+// scanLocalPodFiles scans the filesystem for podcast files and returns sets/maps of their hashes and titles.
+func scanLocalPodFiles(path string) (hashSet, filenamesSet, ttsInFileNames mapset.Set, hashesToTT, ttToHashes map[string]string) {
+	hashSet = mapset.NewSet()
+	filenamesSet = mapset.NewSet()
+	ttsInFileNames = mapset.NewSet()
+	hashesToTT = make(map[string]string)
+	ttToHashes = make(map[string]string)
 
 	files, err := os.ReadDir(path)
 	checkErr(err)
 
-	// Put all the filenames into a set
 	for _, file := range files {
 		filename := file.Name()
 		if filename[:2] != "._" {
-			// Count the number of '-' occurrences because if not 5 and with mp3 then not a well formed filename
 			if strings.Count(filename, "-") == 5 && strings.Contains(filename, mp3) {
-				hash, transformedTitle := hashFromFilename(filename)
-				filenamesHashSet.Add(hash)
+				hash, transformedTitle, err := hashFromFilename(filename)
+				if err != nil {
+					log.Printf("skipping file %s: %v", filename, err)
+					continue
+				}
+				hashSet.Add(hash)
 				filenamesSet.Add(filename)
-
-				hashesToTransformedTitles[hash] = transformedTitle
-				transformedTitlesToHashes[transformedTitle] = hash
+				hashesToTT[hash] = transformedTitle
+				ttToHashes[transformedTitle] = hash
 				ttsInFileNames.Add(transformedTitle)
 			}
 		}
 	}
-	filenamesSlice := filenamesSet.ToSlice()
+	return
+}
 
-	// Get all the file_url_hashes from the db too and put them into another set
+// fetchDbEpisodeHashes queries the database for episode hashes and returns sets/maps for comparison.
+func fetchDbEpisodeHashes(dbFile string) (dbHashSet, transformedTitlesSet mapset.Set, hashesToEpInfo, ttToHashes, hashesToTT map[string]string) {
+	dbHashSet = mapset.NewSet()
+	transformedTitlesSet = mapset.NewSet()
+	hashesToEpInfo = make(map[string]string)
+	ttToHashes = make(map[string]string)
+	hashesToTT = make(map[string]string)
+
 	db, err := sql.Open(sqlite3, dbFile)
 	checkErr(err)
 
@@ -188,111 +188,108 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	rows, err := db.Query(query)
 	checkErr(err)
 
-	// Iterate over the rows in the result
 	for rows.Next() {
-		// Data from db
-		var podcastTitle, title, fileUrlHash, transformedTitle string
-
+		var podcastTitle, title, fileUrlHash string
 		err = rows.Scan(&podcastTitle, &title, &fileUrlHash)
 		checkErr(err)
 
-		// sets and maps
-		transformedTitle = titleTransformation(title)
+		transformedTitle := titleTransformation(title)
 		transformedTitlesSet.Add(transformedTitle)
-		transformedTitlesToHashes[transformedTitle] = fileUrlHash
-		hashesToTransformedTitles[fileUrlHash] = transformedTitle
+		ttToHashes[transformedTitle] = fileUrlHash
+		hashesToTT[fileUrlHash] = transformedTitle
 
 		dbHashSet.Add(fileUrlHash)
 		hashesToEpInfo[fileUrlHash] = fmt.Sprintf("%s: %s", podcastTitle, title)
 	}
+	return
+}
 
-	// slices for convenience
-	dbHashSlice := dbHashSet.ToSlice()
-	fileNamesHashSlice := filenamesHashSet.ToSlice()
-	transformedTitlesSlice := transformedTitlesSet.ToSlice()
+// matchByTransformedTitle removes hashes from candidates where the transformed title
+// matches an existing filename via substring search.
+func matchByTransformedTitle(candidates mapset.Set, ttToHashes map[string]string, filenamesSlice []interface{}, ttsInFileNames mapset.Set) {
+	candidateSlice := candidates.ToSlice()
 
-	fmt.Printf(
-		"\n%d db hashes %d filename hashes %d map between the two\n",
-		len(dbHashSlice),
-		len(fileNamesHashSlice),
-		len(hashesToEpInfo),
-	)
-
-	// whatever is in the db that we do not have as a file
-	inDbNotInFileSet := dbHashSet.Difference(filenamesHashSet)
-	inDbNotInFileSlice := inDbNotInFileSet.ToSlice()
-	nInDbNotInFile := len(inDbNotInFileSlice)
-
-	fmt.Printf("\n%d in db and not in files based on file (URL) hashes\n\n", nInDbNotInFile)
-
-	// range over the transformed titles from the db
-	for _, transformedTitleFromDb := range transformedTitlesSlice {
-		// Firstly see if it's in the hashes we are interested in
-		hashOfInterest := transformedTitlesToHashes[transformedTitleFromDb.(string)]
-		// if the hash is in the set of episodes in the db that we do not already have
-		if inDbNotInFileSet.Contains(hashOfInterest) {
-			// l.Printf("Interested in transformed title %s", v_tts)
-			// If it is then do substring search against every filename
-			for _, v_fn := range filenamesSlice {
-				filename := v_fn.(string)
-				transformedTitle := transformedTitleFromDb.(string)
-
-				// Potential addition: we could also look at the new hash, but this is less imported given we also compare titles below
-				if len(transformedTitle) == 0 || strings.Contains(filename, transformedTitle) {
-					// The transformed title is in a filename and so we can remove the hash in the filename
-					hashToRemove := transformedTitlesToHashes[transformedTitle]
-					inDbNotInFileSet.Remove(hashToRemove)
-				}
+	// Substring match: if a DB title appears in any local filename, remove its hash
+	for _, v := range candidateSlice {
+		hashStr := fmt.Sprintf("%v", v)
+		ttOfInterest := ttToHashes[hashStr]
+		if ttOfInterest == "" {
+			continue
+		}
+		for _, v_fn := range filenamesSlice {
+			filename := fmt.Sprintf("%v", v_fn)
+			if len(ttOfInterest) == 0 || strings.Contains(filename, ttOfInterest) {
+				candidates.Remove(v)
+				break
 			}
 		}
 	}
 
-	inDbNotInFileSlice = inDbNotInFileSet.ToSlice()
-	nInDbNotInFileSlice := len(inDbNotInFileSlice)
-
-	var fmt_str string
-	if nInDbNotInFileSlice > 0 {
-		fmt_str = "%d podcasts are in the feeds which have not been downloaded; being:\n"
-	} else {
-		fmt_str = "%d podcasts are in the feeds which have not been downloaded\n"
-	}
-	fmt.Printf(fmt_str, nInDbNotInFileSlice)
-
-	// go through and remove anything with the same title
-	// reason for doing this is backwards compatibility with my (pre-existing) collection of pods
-	// which used a different hash
-
-	// for range in the hashes
-	for _, v := range inDbNotInFileSlice {
-		// get the associated title
-		ttOfInterest := hashesToTransformedTitles[v.(string)]
-		// is the transformed title in the set of what's in the filenames?
+	// Backwards compatibility pass: remove by exact transformed-title match
+	candidateSlice = candidates.ToSlice()
+	for _, v := range candidateSlice {
+		hashStr := fmt.Sprintf("%v", v)
+		ttOfInterest := ttToHashes[hashStr]
 		if ttsInFileNames.Contains(ttOfInterest) {
-			// if it is, remove it
-			inDbNotInFileSet.Remove(v)
+			candidates.Remove(v)
+		}
+	}
+}
+
+// seeWhatPodsWeAlreadyHave will check the db against files we already have
+func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
+	// Scan local files
+	fileHashSet, filenamesSet, ttsInFileNames, localHashesToTT, localTTToHashes := scanLocalPodFiles(path)
+	filenamesSlice := filenamesSet.ToSlice()
+
+	// Fetch DB episode hashes
+	dbHashSet, _, hashesToEpInfo, dbTTToHashes, dbHashesToTT := fetchDbEpisodeHashes(dbFile)
+
+	// Merge maps: DB entries take priority for tt<->hash mappings used in matching
+	for tt, hash := range localTTToHashes {
+		if _, exists := dbTTToHashes[tt]; !exists {
+			dbTTToHashes[tt] = hash
+		}
+	}
+	for hash, tt := range localHashesToTT {
+		if _, exists := dbHashesToTT[hash]; !exists {
+			dbHashesToTT[hash] = tt
 		}
 	}
 
-	inDbNotInFileSlice = inDbNotInFileSet.ToSlice()
-	nInDbNotInFileSlice = len(inDbNotInFileSlice)
+	fmt.Printf(
+		"\n%d db hashes %d filename hashes %d map between the two\n",
+		dbHashSet.Cardinality(),
+		fileHashSet.Cardinality(),
+		len(hashesToEpInfo),
+	)
+
+	// Whatever is in the db that we do not have as a file
+	inDbNotInFileSet := dbHashSet.Difference(fileHashSet)
+	fmt.Printf("\n%d in db and not in files based on file (URL) hashes\n\n", inDbNotInFileSet.Cardinality())
+
+	// Match by transformed title to remove false positives
+	matchByTransformedTitle(inDbNotInFileSet, dbHashesToTT, filenamesSlice, ttsInFileNames)
+
+	inDbNotInFileSlice := inDbNotInFileSet.ToSlice()
+	nInDbNotInFileSlice := len(inDbNotInFileSlice)
 
 	if nInDbNotInFileSlice > 0 {
-		fmt_str = "%d podcasts are in the feeds which have not been downloaded after fn title scan; being:\n"
+		fmt.Printf("%d podcasts are in the feeds which have not been downloaded after fn title scan; being:\n", nInDbNotInFileSlice)
 	} else {
-		fmt_str = "%d podcasts are in the feeds which have not been downloaded after fn title scan\n"
+		fmt.Printf("%d podcasts are in the feeds which have not been downloaded after fn title scan\n", nInDbNotInFileSlice)
 	}
-	fmt.Printf(fmt_str, nInDbNotInFileSlice)
 
 	counter := 0
 	for _, v := range inDbNotInFileSlice {
-		hash := v.(string)
+		hash := fmt.Sprintf("%v", v)
 		title := hashesToEpInfo[hash]
-		tTitle := hashesToTransformedTitles[hash]
+		tTitle := dbHashesToTT[hash]
 
 		fmt.Printf("%s (%s) (db hash %s)\n", title, tTitle, hash)
 
 		if len([]rune(tTitle)) == 0 {
-			log.Fatal("No tTitle")
+			log.Panic("No tTitle")
 		}
 
 		counter += 1
@@ -424,7 +421,7 @@ func runDownloadScript(podcasts_dir string) {
 }
 
 // tagSinglePod tags the file at filename with the title and album metadata
-func tagSinglePod(filename string, title string, album string) {
+func tagSinglePod(filename string, title string, album string, pythonPath string, eyeD3Dir string) {
 
 	// title tag is title
 	// album is podcast title
@@ -437,7 +434,7 @@ func tagSinglePod(filename string, title string, album string) {
 	// if we fail to open we run eyeD3 to remove any tags and try again
 	if err != nil {
 		fmt.Printf("%s is a file where reading the tags has been problematic %s\n", filename, err)
-		stripTagsWithEyeD3(filename, pythonInterpreterPath, eyeD3Path)
+		stripTagsWithEyeD3(filename, pythonPath, eyeD3Dir)
 		parse = false
 		tag, err = id3v2.Open(filename, id3v2.Options{Parse: parse})
 		checkErr(err)
@@ -486,7 +483,7 @@ func tagSinglePod(filename string, title string, album string) {
 }
 
 // tagThosePods tag all the podcasts
-func tagThosePods(podcasts_dir string) int {
+func tagThosePods(podcasts_dir string, pythonPath string, eyeD3Dir string) int {
 	fmt.Printf("Note: will tag pods in current working directory %s\n", getCwd())
 
 	filenames_set := mapset.NewSet()
@@ -528,7 +525,7 @@ func tagThosePods(podcasts_dir string) int {
 		log.Printf("%s: %s / %s", filename, podcast_title, title)
 
 		// Tag 'em
-		tagSinglePod(filename, title, podcast_title)
+		tagSinglePod(filename, title, podcast_title, pythonPath, eyeD3Dir)
 		count += 1
 		// Set of filenames we need to update in the db
 		filenames_set.Add(ns_filename)
@@ -554,7 +551,7 @@ func tagThosePods(podcasts_dir string) int {
 			checkErr(err)
 
 			if affected != 1 {
-				log.Fatal("More than one row affected which should not happen")
+				log.Panic("More than one row affected which should not happen")
 			}
 		}
 
@@ -739,7 +736,7 @@ Note:
 	}
 
 	if parseOptPtr == nil || seeOptPtr == nil {
-		log.Fatal("Some issue with argparse")
+		log.Panic("Some issue with argparse")
 	}
 
 	// Given we know we have gone past the help message now let's
@@ -754,20 +751,15 @@ Note:
 	}
 
 	// Check we have dependencies and get python path
-	haveDependancies, python, eyeD3Dir := checkDependencies(verbose)
-
-	// Set globals
-	// TODO: globals should be refactored out
-	pythonInterpreterPath = python
-	eyeD3Path = eyeD3Dir
+	haveDependancies, pythonPath, eyeD3Dir := checkDependencies(verbose)
 
 	log.Printf("Have dependencies: %t", haveDependancies)
-	log.Printf("python path is %s", pythonInterpreterPath)
-	log.Printf("eyeD3 folder is %s", eyeD3Path)
+	log.Printf("python path is %s", pythonPath)
+	log.Printf("eyeD3 folder is %s", eyeD3Dir)
 
 	// If we don't have dependencies then we exit
 	if !haveDependancies {
-		log.Fatal("Exiting as we do not have dependancies")
+		log.Panic("Exiting as we do not have dependancies")
 	}
 
 	// First let's get the tables ready to go and create them if not
@@ -775,8 +767,8 @@ Note:
 
 	// Interactive mode is exclusive from the parse/script pipeline
 	if *interactiveMode {
-		if err := runInteractive(podcastsDir); err != nil {
-			log.Fatal(err)
+		if err := runInteractive(podcastsDir, pythonPath, eyeD3Dir); err != nil {
+			log.Panic(err)
 		}
 		return
 	}
@@ -792,7 +784,7 @@ Note:
 		generateDownloadList(podcastsDir)
 		runDownloadScript(podcastsDir)
 		updateDatabaseForDownloads()
-		tagThosePods(podcastsDir)
+		tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
 	} else {
 		if *parseOptPtr {
 			parseThem(confFilePath)
@@ -811,7 +803,7 @@ Note:
 		}
 
 		if *tagPods {
-			tagThosePods(podcastsDir)
+			tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
 		}
 
 		if *listLatestPods {
