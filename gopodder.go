@@ -184,22 +184,22 @@ func fetchDbEpisodeHashes(dbFile string) (dbHashSet, transformedTitlesSet mapset
 		defer db.Close()
 	}
 
-	query := `SELECT podcast_title, title, file_url_hash FROM episodes WHERE file IS NOT NULL AND file !='';`
+	query := `SELECT podcast_title, title, podcastname_episodename_hash FROM episodes WHERE file IS NOT NULL AND file !='';`
 	rows, err := db.Query(query)
 	checkErr(err)
 
 	for rows.Next() {
-		var podcastTitle, title, fileUrlHash string
-		err = rows.Scan(&podcastTitle, &title, &fileUrlHash)
+		var podcastTitle, title, episodeHash string
+		err = rows.Scan(&podcastTitle, &title, &episodeHash)
 		checkErr(err)
 
 		transformedTitle := titleTransformation(title)
 		transformedTitlesSet.Add(transformedTitle)
-		ttToHashes[transformedTitle] = fileUrlHash
-		hashesToTT[fileUrlHash] = transformedTitle
+		ttToHashes[transformedTitle] = episodeHash
+		hashesToTT[episodeHash] = transformedTitle
 
-		dbHashSet.Add(fileUrlHash)
-		hashesToEpInfo[fileUrlHash] = fmt.Sprintf("%s: %s", podcastTitle, title)
+		dbHashSet.Add(episodeHash)
+		hashesToEpInfo[episodeHash] = fmt.Sprintf("%s: %s", podcastTitle, title)
 	}
 	return
 }
@@ -266,10 +266,13 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 
 	// Whatever is in the db that we do not have as a file
 	inDbNotInFileSet := dbHashSet.Difference(fileHashSet)
-	fmt.Printf("\n%d in db and not in files based on file (URL) hashes\n\n", inDbNotInFileSet.Cardinality())
+	fmt.Printf("\n%d in db and not in files based on episode hashes\n\n", inDbNotInFileSet.Cardinality())
 
-	// Match by transformed title to remove false positives
-	matchByTransformedTitle(inDbNotInFileSet, dbHashesToTT, filenamesSlice, ttsInFileNames)
+	// Backwards-compatibility fallback: only use title matching if none of the local
+	// files matched the current episode-hash scheme at all.
+	if fileHashSet.Cardinality() > 0 && inDbNotInFileSet.Cardinality() == dbHashSet.Cardinality() {
+		matchByTransformedTitle(inDbNotInFileSet, dbHashesToTT, filenamesSlice, ttsInFileNames)
+	}
 
 	inDbNotInFileSlice := inDbNotInFileSet.ToSlice()
 	nInDbNotInFileSlice := len(inDbNotInFileSlice)
@@ -336,7 +339,7 @@ func generateDownloadList(podcastsDir string) {
 		checkErr(err)
 
 		// If file_url_hash in hashes ...
-		if hashes.Contains(fileUrlHash) {
+		if hashes.Contains(podcastNameEpisodenameHash) {
 			newFilename := buildNonInteractiveFilename(podcastTitle, title, published, podcastNameEpisodenameHash)
 			filenames = append(filenames, newFilename)
 			urls = append(urls, file)

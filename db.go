@@ -571,6 +571,12 @@ func updateDatabaseForDownloads() {
 
 	// Update or insert as appropriate
 	for _, file := range files {
+		fileStr := fmt.Sprintf("%v", file)
+		hash, _, err := hashFromFilename(fileStr)
+		if err != nil {
+			log.Printf("skipping file %s: %v", fileStr, err)
+			continue
+		}
 
 		// See if it's in already
 		rows, err := db.Query(`
@@ -595,12 +601,12 @@ func updateDatabaseForDownloads() {
 		if count == 1 {
 			stmt, err := db.Prepare(`
 				UPDATE downloads 
-				SET last_seen = ?
+				SET hash = ?, last_seen = ?
 				WHERE filename = ?
 				;`)
 			checkErr(err)
 
-			res, err := stmt.Exec(ts, file)
+			res, err := stmt.Exec(hash, ts, file)
 			checkErr(err)
 
 			affected, err := res.RowsAffected()
@@ -614,15 +620,6 @@ func updateDatabaseForDownloads() {
 		//   If no then add it to the db
 		if count == 0 {
 			log.Println(file, "is not in the db and seems to be a fresh download, adding")
-
-			// Get the hash from the filename
-			fileStr := fmt.Sprintf("%v", file)
-			hash, _, err := hashFromFilename(fileStr)
-			// Skip over error
-			if err != nil {
-				log.Printf("skipping file %s: %v", fileStr, err)
-				continue
-			}
 
 			stmt, err := db.Prepare(`
 				INSERT INTO downloads
