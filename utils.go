@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -284,9 +283,9 @@ func isUpper(s string) bool {
 
 // getCwd is a utility function to return current working directory
 func getCwd() string {
-	ex, err := os.Executable()
+	cwd, err := os.Getwd()
 	checkErr(err)
-	return filepath.Dir(ex)
+	return cwd
 }
 
 // titleTransformation takes a podcast title and transforms it (removing spaces etc)
