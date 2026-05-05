@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/md5"
 	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -92,5 +96,50 @@ func TestNullPodcastTitleCleanup(t *testing.T) {
 	}
 	if survivingTitle != "Good Interactive" {
 		t.Fatalf("expected surviving title %q, got %q", "Good Interactive", survivingTitle)
+	}
+}
+
+func TestUpdateDatabaseForDownloadsNormalizesExistingHash(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	podcastTitle := "Repair Show"
+	episodeTitle := "Repair Episode"
+	filename := buildEpisodeFilename(podcastTitle, episodeTitle, "2024-01-02")
+	fullPath := filepath.Join(tmpDir, filename)
+	if err := os.WriteFile(fullPath, []byte("mp3"), 0666); err != nil {
+		t.Fatalf("write podcast file: %v", err)
+	}
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	oldHash := fmt.Sprintf("%x", md5.Sum([]byte("https://example.com/audio.mp3")))
+	_, err = db.Exec(`
+		INSERT INTO downloads (filename, hash, first_seen, last_seen, tagged_at)
+		VALUES (?, ?, ?, ?, NULL)
+		;`,
+		filename, oldHash, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",
+	)
+	if err != nil {
+		t.Fatalf("insert downloads row: %v", err)
+	}
+
+	updateDatabaseForDownloads()
+
+	wantHash, _, err := hashFromFilename(filename)
+	if err != nil {
+		t.Fatalf("hashFromFilename: %v", err)
+	}
+
+	var gotHash string
+	if err := db.QueryRow(`SELECT hash FROM downloads WHERE filename = ?;`, filename).Scan(&gotHash); err != nil {
+		t.Fatalf("query downloads row: %v", err)
+	}
+	if gotHash != wantHash {
+		t.Fatalf("got hash %q, want %q", gotHash, wantHash)
 	}
 }
