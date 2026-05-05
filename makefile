@@ -11,7 +11,7 @@ test:
 	go test ./...
 
 build:
-	go build -o $(name) *.go
+	go121 build -o $(name) *.go
 
 interactive: build
 	./$(name) --interactive

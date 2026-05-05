@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/md5"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -66,6 +67,22 @@ func TestIsHttpError(t *testing.T) {
 	}
 }
 
+func TestGetCwdReturnsProcessWorkingDirectory(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+
+	got, err := filepath.EvalSymlinks(getCwd())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(getCwd): %v", err)
+	}
+	want, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(tmpDir): %v", err)
+	}
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestInteractiveAndNonInteractiveFilenamesMatch(t *testing.T) {
 	now := time.Date(2025, 2, 3, 4, 5, 6, 0, time.UTC)
 	podcastTitle := "Example Podcast"
@@ -112,9 +129,9 @@ func TestHashFromFilenameErrors(t *testing.T) {
 		filename string
 	}{
 		{"no dashes or dots", "nodashes"},
-		{"single dot only", "nodashes.mp3"},   // becomes "nodashes-mp3" → 2 parts
-		{"one dash only", "one-dash"},          // 2 parts
-		{"empty string", ""},                   // 1 part
+		{"single dot only", "nodashes.mp3"}, // becomes "nodashes-mp3" → 2 parts
+		{"one dash only", "one-dash"},       // 2 parts
+		{"empty string", ""},                // 1 part
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,9 +155,9 @@ func TestScanLocalPodFiles(t *testing.T) {
 	// Files that should be skipped
 	invalidFiles := []string{
 		"._PodTitle-2024-01-02-EpTitle-hidden.mp3", // starts with ._
-		"wrong-dashes.mp3",                          // not 5 dashes
-		"no-mp3-2024-01-02-title-hash.txt",          // no mp3
-		"readme.txt",                                 // not a podcast
+		"wrong-dashes.mp3",                         // not 5 dashes
+		"no-mp3-2024-01-02-title-hash.txt",         // no mp3
+		"readme.txt",                               // not a podcast
 	}
 
 	for _, f := range append(validFiles, invalidFiles...) {
@@ -253,6 +270,64 @@ func TestMatchByTransformedTitleEmptyCandidates(t *testing.T) {
 
 	if candidates.Cardinality() != 0 {
 		t.Errorf("expected 0 candidates, got %d", candidates.Cardinality())
+	}
+}
+
+func TestGenerateDownloadListKeepsNewEpisodesWithCollidingTransformedTitles(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Numbers Show"
+	oldTitle := "Episode 235"
+	newTitle := "Episode 236"
+
+	oldEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+oldTitle)))
+	newEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+newTitle)))
+	oldFileURL := "https://example.com/235.mp3"
+	newFileURL := "https://example.com/236.mp3"
+	oldFileURLHash := fmt.Sprintf("%x", md5.Sum([]byte(oldFileURL)))
+	newFileURLHash := fmt.Sprintf("%x", md5.Sum([]byte(newFileURL)))
+
+	oldFilename := buildEpisodeFilenameWithHash(podcastTitle, oldTitle, "2024-01-01", oldEpisodeHash)
+	if err := os.WriteFile(filepath.Join(tmpDir, oldFilename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write existing file: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		oldTitle, "2024-01-01T00:00:00Z", ts, ts, podcastTitle, oldEpisodeHash, oldFileURLHash, oldFileURL,
+		newTitle, "2024-01-02T00:00:00Z", ts, ts, podcastTitle, newEpisodeHash, newFileURLHash, newFileURL,
+	)
+	if err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	generateDownloadList(tmpDir)
+
+	scriptPath := filepath.Join(tmpDir, "download_pods.sh")
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read download script: %v", err)
+	}
+
+	scriptText := string(script)
+	if !strings.Contains(scriptText, newFileURL) {
+		t.Fatalf("expected download script to include new episode URL %q, got %q", newFileURL, scriptText)
+	}
+	if strings.Contains(scriptText, oldFileURL) {
+		t.Fatalf("expected download script to exclude existing episode URL %q, got %q", oldFileURL, scriptText)
 	}
 }
 
