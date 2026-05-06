@@ -29,6 +29,7 @@ const confFile = gopodder + ".conf"
 const dbFileName = gopodder + ".sqlite"
 const confVarEnvName = "GOPODCONF"
 const pathVarEnvName = "GOPODDIR"
+const archivesVarEnvName = "GOPODDIR_ARCHIVES"
 const sqlite3 = "sqlite3" // Used with sql.Open
 const author = "author"
 const category = "category"
@@ -138,20 +139,28 @@ func sensibleFilesInDir(path string) mapset.Set {
 	return filenamesSet
 }
 
-// scanLocalPodFiles scans the filesystem for podcast files and returns sets/maps of their hashes and titles.
-func scanLocalPodFiles(path string) (hashSet, filenamesSet, ttsInFileNames mapset.Set, hashesToTT, ttToHashes map[string]string) {
+// scanLocalPodFiles scans the filesystem for podcast files across one or more
+// directories, returning unioned sets/maps of their hashes and titles. The
+// first path is treated as the primary podcasts dir; any extras are typically
+// archive scan paths from $GOPODDIR_ARCHIVES. If any path cannot be read, this
+// panics via checkErr — abort loud rather than silently regenerate the
+// download script.
+func scanLocalPodFiles(paths []string) (hashSet, filenamesSet, ttsInFileNames mapset.Set, hashesToTT, ttToHashes map[string]string) {
 	hashSet = mapset.NewSet()
 	filenamesSet = mapset.NewSet()
 	ttsInFileNames = mapset.NewSet()
 	hashesToTT = make(map[string]string)
 	ttToHashes = make(map[string]string)
 
-	files, err := os.ReadDir(path)
-	checkErr(err)
+	for _, path := range paths {
+		files, err := os.ReadDir(path)
+		checkErr(err)
 
-	for _, file := range files {
-		filename := file.Name()
-		if filename[:2] != "._" {
+		for _, file := range files {
+			filename := file.Name()
+			if len(filename) < 2 || filename[:2] == "._" {
+				continue
+			}
 			if strings.Count(filename, "-") == 5 && strings.Contains(filename, mp3) {
 				hash, transformedTitle, err := hashFromFilename(filename)
 				if err != nil {
@@ -236,11 +245,18 @@ func matchByTransformedTitle(candidates mapset.Set, ttToHashes map[string]string
 	}
 }
 
-// seeWhatPodsWeAlreadyHave will check the db against files we already have
-func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
-	// Scan local files
-	fileHashSet, filenamesSet, ttsInFileNames, localHashesToTT, localTTToHashes := scanLocalPodFiles(path)
+// seeWhatPodsWeAlreadyHave will check the db against files we already have.
+// scanPaths is the list of directories to scan: typically [podcastsDir] plus
+// any extras from $GOPODDIR_ARCHIVES. Hashes registered in archived_episodes
+// (see Option B / --register-archive) are also treated as "already have".
+func seeWhatPodsWeAlreadyHave(dbFile string, scanPaths []string) mapset.Set {
+	// Scan local files (across primary + archive scan paths)
+	fileHashSet, filenamesSet, ttsInFileNames, localHashesToTT, localTTToHashes := scanLocalPodFiles(scanPaths)
 	filenamesSlice := filenamesSet.ToSlice()
+
+	// DB-backed archive registry: hashes here count as "already have" even if
+	// the corresponding file isn't visible on any current scan path.
+	archivedHashSet := fetchArchivedHashes()
 
 	// Fetch DB episode hashes
 	dbHashSet, _, hashesToEpInfo, dbTTToHashes, dbHashesToTT := fetchDbEpisodeHashes(dbFile)
@@ -258,18 +274,20 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	}
 
 	fmt.Printf(
-		"\n%d db hashes %d filename hashes %d map between the two\n",
+		"\n%d db hashes %d filename hashes %d archived hashes %d map between the two\n",
 		dbHashSet.Cardinality(),
 		fileHashSet.Cardinality(),
+		archivedHashSet.Cardinality(),
 		len(hashesToEpInfo),
 	)
 
-	// Whatever is in the db that we do not have as a file
-	inDbNotInFileSet := dbHashSet.Difference(fileHashSet)
-	fmt.Printf("\n%d in db and not in files based on episode hashes\n\n", inDbNotInFileSet.Cardinality())
+	// Whatever is in the db that we do not have on disk and is not registered as archived
+	haveHashSet := fileHashSet.Union(archivedHashSet)
+	inDbNotInFileSet := dbHashSet.Difference(haveHashSet)
+	fmt.Printf("\n%d in db and not on disk or registered as archived\n\n", inDbNotInFileSet.Cardinality())
 
-	// Backwards-compatibility fallback: only use title matching if none of the local
-	// files matched the current episode-hash scheme at all.
+	// Backwards-compatibility fallback: only use title matching if there are
+	// local new-scheme files but none of them matched a db hash.
 	if fileHashSet.Cardinality() > 0 && inDbNotInFileSet.Cardinality() == dbHashSet.Cardinality() {
 		matchByTransformedTitle(inDbNotInFileSet, dbHashesToTT, filenamesSlice, ttsInFileNames)
 	}
@@ -306,9 +324,12 @@ func seeWhatPodsWeAlreadyHave(dbFile string, path string) mapset.Set {
 	return inDbNotInFileSet
 }
 
-// generateDownloadList generates download script based on the pods to download
-func generateDownloadList(podcastsDir string) {
-	hashes := seeWhatPodsWeAlreadyHave(dbFileName, podcastsDir)
+// generateDownloadList generates download script based on the pods to download.
+// podcastsDir is the primary podcasts directory (and where download_pods.sh is
+// written). scanPaths is the full set of directories to scan when deciding
+// what's already downloaded — typically [podcastsDir, ...archives].
+func generateDownloadList(podcastsDir string, scanPaths []string) {
+	hashes := seeWhatPodsWeAlreadyHave(dbFileName, scanPaths)
 
 	log.Println("Pods for download are")
 
@@ -664,10 +685,32 @@ func latestPodsFromDb(path string) {
 	}
 }
 
+// buildScanPaths returns the deduplicated list of directories that
+// scanLocalPodFiles should consult: the primary podcasts dir first, followed
+// by any extras from $GOPODDIR_ARCHIVES (PathListSeparator-separated). The
+// primary dir is always included. Empty entries are skipped.
+func buildScanPaths(podcastsDir, archivesEnv string) []string {
+	paths := []string{podcastsDir}
+	if strings.TrimSpace(archivesEnv) == "" {
+		return paths
+	}
+	seen := map[string]bool{podcastsDir: true}
+	for _, p := range strings.Split(archivesEnv, string(os.PathListSeparator)) {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
+}
+
 func main() {
 	// Get conf file path from env
 	confFilePath, confVarIsSet := os.LookupEnv(confVarEnvName)
 	podcastsDir, pathVarIsSet := os.LookupEnv(pathVarEnvName)
+	archivesEnv, archivesVarIsSet := os.LookupEnv(archivesVarEnvName)
 
 	// Use default if not set
 	// we let the user know a bit further down
@@ -700,6 +743,16 @@ Typical use:
 	-l will list the (up to) 100 latest podcasts from the db
 	-i will launch interactive mode
 
+	Archiving (off-load older pods to another volume):
+	--register-archive <dir>    Mark files in <dir> as archived; -s will not
+	                            queue them for re-download even if <dir> is
+	                            unmounted later.
+	--unregister-archive <dir>  Inverse, e.g. when moving files back.
+	--reconcile-archive         Drop registrations whose path no longer exists.
+	$GOPODDIR_ARCHIVES          Colon-separated extra dirs to scan for already-
+	                            downloaded files (mounted alternative to the
+	                            registry above).
+
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
 	will save pods into %s; and
@@ -723,6 +776,10 @@ Note:
 	verboseOpt := parser.Flag("v", "verbose", &argparse.Options{Required: false, Help: "Verbose"})
 	listLatestPods := parser.Flag("l", "list", &argparse.Options{Required: false, Help: "List latest pods"})
 	interactiveMode := parser.Flag("i", "interactive", &argparse.Options{Required: false, Help: "Interactive episode picker"})
+
+	registerArchiveOpt := parser.String("", "register-archive", &argparse.Options{Required: false, Help: "Register podcast files in <dir> as archived (won't be re-downloaded even if dir is unmounted)"})
+	unregisterArchiveOpt := parser.String("", "unregister-archive", &argparse.Options{Required: false, Help: "Remove archive registrations matching files currently in <dir>"})
+	reconcileArchiveOpt := parser.Flag("", "reconcile-archive", &argparse.Options{Required: false, Help: "Drop archive registrations whose archived path no longer resolves on disk"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -753,6 +810,13 @@ Note:
 		log.Printf(tmp_fmt, pathVarEnvName, podcastsDir)
 	}
 
+	// Build the list of directories to scan when deciding what's already
+	// downloaded: primary dir first, then any extras from GOPODDIR_ARCHIVES.
+	scanPaths := buildScanPaths(podcastsDir, archivesEnv)
+	if archivesVarIsSet && len(scanPaths) > 1 {
+		log.Printf("%s adds %d archive scan path(s): %s", archivesVarEnvName, len(scanPaths)-1, strings.Join(scanPaths[1:], ", "))
+	}
+
 	// Check we have dependencies and get python path
 	haveDependancies, pythonPath, eyeD3Dir := checkDependencies(verbose)
 
@@ -767,6 +831,27 @@ Note:
 
 	// First let's get the tables ready to go and create them if not
 	createTablesIfNotExist()
+
+	// Archive-registry commands are independent of the parse/download pipeline.
+	// Each one runs and exits — chaining with -p/-s/-d/-u/-t isn't supported.
+	if r := strings.TrimSpace(*registerArchiveOpt); r != "" {
+		n, err := registerArchiveDir(r)
+		checkErr(err)
+		log.Printf("registered %d archived episode(s) from %s", n, r)
+		return
+	}
+	if u := strings.TrimSpace(*unregisterArchiveOpt); u != "" {
+		n, err := unregisterArchiveDir(u)
+		checkErr(err)
+		log.Printf("unregistered %d archived episode(s) matching %s", n, u)
+		return
+	}
+	if *reconcileArchiveOpt {
+		n, err := reconcileArchiveRegistry()
+		checkErr(err)
+		log.Printf("removed %d stale archive registration(s)", n)
+		return
+	}
 
 	// Interactive mode is exclusive from the parse/script pipeline
 	if *interactiveMode {
@@ -784,7 +869,7 @@ Note:
 
 	if *doAll {
 		parseThem(confFilePath)
-		generateDownloadList(podcastsDir)
+		generateDownloadList(podcastsDir, scanPaths)
 		runDownloadScript(podcastsDir)
 		updateDatabaseForDownloads()
 		tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
@@ -794,7 +879,7 @@ Note:
 		}
 
 		if *seeOptPtr {
-			generateDownloadList(podcastsDir)
+			generateDownloadList(podcastsDir, scanPaths)
 		}
 
 		if *downloadPods {

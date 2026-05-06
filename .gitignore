@@ -15,6 +15,7 @@ gopodder
 
 # MacOS
 .DS_Store
+._*
 
 # Binaries for programs and plugins
 *.exe

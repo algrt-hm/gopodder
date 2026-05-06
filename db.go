@@ -136,6 +136,19 @@ func createTablesIfNotExist() {
 	);
 	`
 
+	createArchivedEpisodes := `
+	CREATE TABLE IF NOT EXISTS archived_episodes (
+		podcastname_episodename_hash TEXT PRIMARY KEY,
+		archived_path TEXT,
+		archived_at TEXT NOT NULL
+	);
+	`
+
+	createArchivedEpisodesPathIdx := `
+	CREATE INDEX IF NOT EXISTS idx_archived_episodes_path
+	ON archived_episodes (archived_path);
+	`
+
 	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 
@@ -173,6 +186,16 @@ func createTablesIfNotExist() {
 		checkErr(err)
 
 		statement, err = db.Prepare(createDownloaded)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
+		statement, err = db.Prepare(createArchivedEpisodes)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
+		statement, err = db.Prepare(createArchivedEpisodesPathIdx)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
