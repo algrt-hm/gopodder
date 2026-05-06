@@ -113,6 +113,38 @@ Behaviour:
 
 Note: the `interactive_episodes` table is populated during feed parsing (`-p` / `-a`); existing `episodes` rows are not backfilled automatically.
 
+### Archiving older podcasts
+
+If your podcast directory has grown large, you can off-load older files to a different volume without having `gopodder` re-download them on the next run. There are two complementary mechanisms:
+
+1. **`$GOPODDIR_ARCHIVES`** — a `:`-separated list of additional directories to scan for already-downloaded files. Use this when the archive volume is normally mounted.
+
+    ``` shell
+    export GOPODDIR_ARCHIVES=/mnt/bronze/new_podcasts_archive
+    ./gopodder -s
+    ```
+
+    If a configured archive path can't be read at scan time, `gopodder` aborts loudly rather than silently treating files as missing.
+
+2. **Archive registry** (`archived_episodes` table) — a DB-backed list of episode hashes that should be treated as already-downloaded regardless of whether the volume is currently mounted.
+
+    ``` shell
+    # After you've moved files to the archive volume:
+    ./gopodder --register-archive /mnt/bronze/new_podcasts_archive
+
+    # If you move files back into the primary dir:
+    ./gopodder --unregister-archive /mnt/bronze/new_podcasts_archive
+
+    # Drop registry rows whose archived path no longer exists on disk:
+    ./gopodder --reconcile-archive
+    ```
+
+    Each of these is a one-shot command (run-and-exit); they don't combine with `-p/-s/-d/-u/-t`.
+
+The two mechanisms compose: registered hashes are always treated as "have"; mounted archive paths additionally provide visibility for tools that want to inspect filenames. For an off-line/cold archive, the registry alone is sufficient.
+
+The interactive picker also marks episodes as already-downloaded if they are in either `downloads` or `archived_episodes`.
+
 ### To install dependencies
 
 - MacOS: `brew install eye-d3 wget`
@@ -124,12 +156,13 @@ Note: the `interactive_episodes` table is populated during feed parsing (`-p` / 
 
 Database Design (SQLite)
 
-Four tables: `podcasts`, `episodes`, `interactive_episodes`, and `downloads`.
+Five tables: `podcasts`, `episodes`, `interactive_episodes`, `downloads`, and `archived_episodes`.
 
 - `podcasts` uses `title` as the primary key, meaning title changes would create a new record rather than updating
 - `episodes` and `interactive_episodes` are keyed on an MD5 hash of `podcast_title` + `episode_title`
     - The `interactive_episodes` table duplicates the `episodes` schema — this redundancy exists to separate batch vs. TUI concerns
 - `downloads` tracks filenames and tagging status (`tagged_at`)
+- `archived_episodes` records episode hashes that have been off-loaded to another volume; rows here suppress re-download (see "Archiving older podcasts" above)
 - No foreign key constraints exist between tables
 
 ### Dependencies
@@ -147,6 +180,8 @@ The codebase is a flat, single-package Go project with clear file-level separati
 │ gopodder.go    │ Entry point, CLI args, batch orchestration      │
 ├────────────────┼─────────────────────────────────────────────────┤
 │ db.go          │ SQLite schema, all database operations          │
+├────────────────┼─────────────────────────────────────────────────┤
+│ archive.go     │ Archive registry (register/unregister/reconcile)│
 ├────────────────┼─────────────────────────────────────────────────┤
 │ interactive.go │ Bubble Tea TUI (multi-step episode picker)      │
 ├────────────────┼─────────────────────────────────────────────────┤

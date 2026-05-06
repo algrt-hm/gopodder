@@ -166,7 +166,7 @@ func TestScanLocalPodFiles(t *testing.T) {
 		}
 	}
 
-	hashSet, filenamesSet, ttsInFileNames, hashesToTT, ttToHashes := scanLocalPodFiles(dir)
+	hashSet, filenamesSet, ttsInFileNames, hashesToTT, ttToHashes := scanLocalPodFiles([]string{dir})
 
 	// Should have exactly 2 valid files
 	if filenamesSet.Cardinality() != 2 {
@@ -208,7 +208,7 @@ func TestScanLocalPodFiles(t *testing.T) {
 
 func TestScanLocalPodFilesEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	hashSet, filenamesSet, ttsInFileNames, _, _ := scanLocalPodFiles(dir)
+	hashSet, filenamesSet, ttsInFileNames, _, _ := scanLocalPodFiles([]string{dir})
 
 	if hashSet.Cardinality() != 0 {
 		t.Errorf("expected 0 hashes, got %d", hashSet.Cardinality())
@@ -314,7 +314,7 @@ func TestGenerateDownloadListKeepsNewEpisodesWithCollidingTransformedTitles(t *t
 		t.Fatalf("insert episodes: %v", err)
 	}
 
-	generateDownloadList(tmpDir)
+	generateDownloadList(tmpDir, []string{tmpDir})
 
 	scriptPath := filepath.Join(tmpDir, "download_pods.sh")
 	script, err := os.ReadFile(scriptPath)
@@ -328,6 +328,217 @@ func TestGenerateDownloadListKeepsNewEpisodesWithCollidingTransformedTitles(t *t
 	}
 	if strings.Contains(scriptText, oldFileURL) {
 		t.Fatalf("expected download script to exclude existing episode URL %q, got %q", oldFileURL, scriptText)
+	}
+}
+
+func TestScanLocalPodFilesUnionsAcrossPaths(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dirA, "PodA-2024-01-02-Ep-aaa111.mp3"), []byte("a"), 0666); err != nil {
+		t.Fatalf("write A: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dirB, "PodB-2024-01-02-Ep-bbb222.mp3"), []byte("b"), 0666); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+
+	hashSet, filenamesSet, _, _, _ := scanLocalPodFiles([]string{dirA, dirB})
+	if hashSet.Cardinality() != 2 {
+		t.Fatalf("got %d hashes, want 2", hashSet.Cardinality())
+	}
+	if !hashSet.Contains("aaa111") || !hashSet.Contains("bbb222") {
+		t.Fatalf("expected both hashes present, got %v", hashSet)
+	}
+	if filenamesSet.Cardinality() != 2 {
+		t.Fatalf("got %d filenames, want 2", filenamesSet.Cardinality())
+	}
+}
+
+func TestBuildScanPaths(t *testing.T) {
+	cases := []struct {
+		name        string
+		podcastsDir string
+		archivesEnv string
+		want        []string
+	}{
+		{"empty env returns just primary", "/p", "", []string{"/p"}},
+		{"single extra path", "/p", "/a", []string{"/p", "/a"}},
+		{"multiple paths", "/p", "/a:/b:/c", []string{"/p", "/a", "/b", "/c"}},
+		{"dedupe primary", "/p", "/p:/a", []string{"/p", "/a"}},
+		{"dedupe extras", "/p", "/a:/a:/b", []string{"/p", "/a", "/b"}},
+		{"empty entries skipped", "/p", ":/a::", []string{"/p", "/a"}},
+		{"whitespace trimmed", "/p", " /a : /b ", []string{"/p", "/a", "/b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildScanPaths(tc.podcastsDir, tc.archivesEnv)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("idx %d: got %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestArchivedEpisodesExcludedFromDownloadList(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Archive Test Show"
+	archivedEpTitle := "Archived Episode"
+	freshEpTitle := "Fresh Episode"
+
+	archivedHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+archivedEpTitle)))
+	freshHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+freshEpTitle)))
+	archivedURL := "https://example.com/archived.mp3"
+	freshURL := "https://example.com/fresh.mp3"
+	archivedURLHash := fmt.Sprintf("%x", md5.Sum([]byte(archivedURL)))
+	freshURLHash := fmt.Sprintf("%x", md5.Sum([]byte(freshURL)))
+
+	if _, err := db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		archivedEpTitle, "2020-01-01T00:00:00Z", ts, ts, podcastTitle, archivedHash, archivedURLHash, archivedURL,
+		freshEpTitle, "2024-01-02T00:00:00Z", ts, ts, podcastTitle, freshHash, freshURLHash, freshURL,
+	); err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	if _, err := db.Exec(`
+		INSERT INTO archived_episodes (podcastname_episodename_hash, archived_path, archived_at)
+		VALUES (?, ?, ?)
+		;`, archivedHash, "/some/archive/path/archived.mp3", ts); err != nil {
+		t.Fatalf("insert archived row: %v", err)
+	}
+
+	// Neither episode has a local file in tmpDir.
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	scriptText, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err != nil {
+		t.Fatalf("read script: %v", err)
+	}
+	text := string(scriptText)
+	if !strings.Contains(text, freshURL) {
+		t.Fatalf("expected fresh URL %q in download script, got %q", freshURL, text)
+	}
+	if strings.Contains(text, archivedURL) {
+		t.Fatalf("expected archived URL %q to be EXCLUDED from download script, got %q", archivedURL, text)
+	}
+}
+
+func TestRegisterAndUnregisterArchiveDir(t *testing.T) {
+	useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	archiveDir := t.TempDir()
+	for _, name := range []string{
+		"PodA-2020-01-02-Ep_One-aaa111.mp3",
+		"PodA-2020-02-03-Ep_Two-bbb222.mp3",
+		"not-a-podcast.txt",
+		"._PodA-2020-03-04-Hidden-ccc333.mp3",
+	} {
+		if err := os.WriteFile(filepath.Join(archiveDir, name), []byte("x"), 0666); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	n, err := registerArchiveDir(archiveDir)
+	if err != nil {
+		t.Fatalf("registerArchiveDir: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("registered %d, want 2", n)
+	}
+
+	hashes := fetchArchivedHashes()
+	if !hashes.Contains("aaa111") || !hashes.Contains("bbb222") {
+		t.Fatalf("expected both hashes registered, got %v", hashes)
+	}
+	if hashes.Cardinality() != 2 {
+		t.Fatalf("got %d archived hashes, want 2", hashes.Cardinality())
+	}
+
+	// Re-running register on the same dir should refresh, not duplicate.
+	n, err = registerArchiveDir(archiveDir)
+	if err != nil {
+		t.Fatalf("second registerArchiveDir: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("re-registered %d, want 2", n)
+	}
+	if fetchArchivedHashes().Cardinality() != 2 {
+		t.Fatalf("expected still 2 archived hashes after re-register")
+	}
+
+	// Unregister.
+	n, err = unregisterArchiveDir(archiveDir)
+	if err != nil {
+		t.Fatalf("unregisterArchiveDir: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("unregistered %d, want 2", n)
+	}
+	if fetchArchivedHashes().Cardinality() != 0 {
+		t.Fatalf("expected 0 archived hashes after unregister")
+	}
+}
+
+func TestReconcileArchiveRegistry(t *testing.T) {
+	useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	archiveDir := t.TempDir()
+	stillThere := "PodA-2020-01-02-Still_There-aaa111.mp3"
+	if err := os.WriteFile(filepath.Join(archiveDir, stillThere), []byte("x"), 0666); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if _, err := registerArchiveDir(archiveDir); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Inject a registry row pointing at a path that doesn't exist.
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	missingPath := filepath.Join(archiveDir, "definitely-not-here.mp3")
+	if _, err := db.Exec(`
+		INSERT INTO archived_episodes (podcastname_episodename_hash, archived_path, archived_at)
+		VALUES (?, ?, ?)
+		;`, "ghost123", missingPath, ts); err != nil {
+		t.Fatalf("insert ghost: %v", err)
+	}
+
+	removed, err := reconcileArchiveRegistry()
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d, want 1", removed)
+	}
+	hashes := fetchArchivedHashes()
+	if hashes.Contains("ghost123") {
+		t.Fatalf("ghost row should have been removed")
+	}
+	if !hashes.Contains("aaa111") {
+		t.Fatalf("present-on-disk row should have been kept")
 	}
 }
 

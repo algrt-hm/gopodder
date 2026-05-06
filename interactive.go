@@ -1024,6 +1024,8 @@ func loadEpisodeItemsFromDatabase(podcastTitle string) ([]episodeItem, error) {
 			COALESCE(i.podcastname_episodename_hash, ''),
 			CASE WHEN EXISTS (
 				SELECT 1 FROM downloads AS d WHERE d.hash = i.podcastname_episodename_hash
+			) OR EXISTS (
+				SELECT 1 FROM archived_episodes AS ar WHERE ar.podcastname_episodename_hash = i.podcastname_episodename_hash
 			) THEN 1 ELSE 0 END
 		FROM interactive_episodes AS i
 		LEFT JOIN episodes AS e
