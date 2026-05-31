@@ -417,14 +417,16 @@ func stripTagsWithEyeD3(filename string, pythonInterpreterPath string, eyeD3Path
 	fmt.Printf("Reading with %s:", eyeD3)
 	cmd := exec.Command(pythonInterpreterPath, eyeD3Path, filename)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// eyeD3 writes informational messages (e.g. "No ID3 v1.x/v2.x tag found!")
+	// to stderr; route them to stdout so they're captured when stdout is redirected
+	cmd.Stderr = os.Stdout
 	err := cmd.Run()
 	checkErr(err)
 
 	fmt.Printf("Removing tags with %s:", eyeD3)
 	cmd = exec.Command(pythonInterpreterPath, eyeD3Path, "--remove-all", filename)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = os.Stdout
 	err = cmd.Run()
 	checkErr(err)
 }
@@ -439,7 +441,9 @@ func runDownloadScript(podcasts_dir string) {
 
 	cmd := exec.Command("/bin/sh", podcasts_dir+"/download_pods.sh")
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// wget writes its progress output to stderr; route it to stdout so it's
+	// captured when stdout is redirected
+	cmd.Stderr = os.Stdout
 	err := cmd.Run()
 	checkErr(err)
 }
