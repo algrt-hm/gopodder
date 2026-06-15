@@ -12,10 +12,13 @@ import (
 )
 
 type latestPodResult struct {
-	author        sql.NullString
-	title         sql.NullString
-	published     sql.NullString
-	podcast_title sql.NullString
+	author          sql.NullString
+	title           sql.NullString
+	published       sql.NullString
+	podcast_title   sql.NullString
+	dateForFilename sql.NullString
+	hash            sql.NullString
+	file            sql.NullString
 }
 
 // nullStrToStr is a utility function to convert a NullString to a string
@@ -121,6 +124,16 @@ func createTablesIfNotExist() {
 	ON episodes (file_url_hash);
 	`
 
+	// podEpisodesIntoDatabase updates last_seen with `WHERE title = ?` on every
+	// already-known episode, every run. Without this index that is a full table
+	// scan per episode (~23k scans of ~23k rows = the dominant cost of a parse:
+	// ~19 min of pread() syscalls). With it the update is an index lookup and the
+	// whole parse drops from ~25 min to seconds.
+	createEpisodesTitleIdx := `
+	CREATE INDEX IF NOT EXISTS idx_episodes_title
+	ON episodes (title);
+	`
+
 	createInteractiveEpisodesFileUrlHashIdx := `
 	CREATE INDEX IF NOT EXISTS idx_interactive_episodes_file_url_hash
 	ON interactive_episodes (file_url_hash);
@@ -180,6 +193,11 @@ func createTablesIfNotExist() {
 		_, err = statement.Exec()
 		checkErr(err)
 
+		statement, err = db.Prepare(createEpisodesTitleIdx)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
 		statement, err = db.Prepare(createInteractiveEpisodesFileUrlHashIdx)
 		checkErr(err)
 		_, err = statement.Exec()
@@ -208,22 +226,36 @@ func createTablesIfNotExist() {
 	}
 }
 
-// podEpisodesIntoDatabase adds the podcast metadata to the db
-func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
+// podEpisodesIntoDatabase adds the podcast metadata to the db.
+//
+// All writes for one feed are wrapped in a single transaction, and the
+// per-episode statements are prepared once and reused. Previously every episode
+// produced ~2 autocommitted writes (a last_seen UPDATE plus an
+// interactive_episodes upsert), each forcing its own fsync — the dominant cost
+// of a parse on the local ZFS pool. Batching turns that into one commit per
+// feed. The SQL and the insert/update/upsert decision logic are unchanged, so
+// the resulting rows are identical to the previous autocommit version; the only
+// behavioural difference is that a feed's writes are now atomic (all-or-nothing
+// if an error aborts mid-feed). The caller owns db and must not have it closed.
+func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 
 	// For the podcast
 	// 1. Is it in the db?
 	//   If yes then update the last seen timestamp
 	//   If no then add it to the db
 
-	db, err := sql.Open(sqlite3, dbFileName)
+	tx, err := db.Begin()
 	checkErr(err)
-	if err == nil {
-		defer db.Close()
-	}
+	committed := false
+	defer func() {
+		// No-op once Commit has succeeded; otherwise unwind the feed's writes.
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 
 	// 1. Is it in the db?
-	rows, err := db.Query(`
+	rows, err := tx.Query(`
 		SELECT count(*) AS COUNT
 		FROM podcasts
 		WHERE podcasts.title=?
@@ -246,14 +278,11 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			log.Println(pod[title], "is already in the db")
 		}
 
-		stmt, err := db.Prepare(`
+		res, err := tx.Exec(`
 			UPDATE podcasts
 			SET last_seen = ?
 			WHERE title = ?
-			;`)
-		checkErr(err)
-
-		res, err := stmt.Exec(ts, pod[title])
+			;`, ts, pod[title])
 		checkErr(err)
 
 		affected, err := res.RowsAffected()
@@ -271,16 +300,13 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 
 		log.Println(pod[title], "is not in the db and seems to be a new podcast, adding")
 
-		stmt, err := db.Prepare(`
+		// We wrap these because we don't want empty strings in the db ideally
+		res, err := tx.Exec(`
 			INSERT INTO podcasts
 			(author, category, description, language, link, title, first_seen, last_seen)
 			VALUES
 			(?, ?, ?, ?, ?, ?, ?, ?)
-			;`)
-		checkErr(err)
-
-		// We wrap these because we don't want empty strings in the db ideally
-		res, err := stmt.Exec(
+			;`,
 			nullWrap(pod[author]),
 			nullWrap(pod[category]),
 			nullWrap(pod[description]),
@@ -303,6 +329,45 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 	// Is it in the db?
 	//   If yes then update the last seen timestamp
 	//   If no then add it to the db
+	//
+	// Prepare the per-episode statements once and reuse them for every episode
+	// in this feed/transaction, rather than re-preparing inside the loop.
+	epCountStmt, err := tx.Prepare(`
+		SELECT count(*) AS COUNT
+		FROM episodes
+		WHERE podcastname_episodename_hash=?
+		;`)
+	checkErr(err)
+	defer epCountStmt.Close()
+
+	epUpdateStmt, err := tx.Prepare(`
+		UPDATE episodes
+		SET last_seen = ?
+		WHERE title = ?
+		;`)
+	checkErr(err)
+	defer epUpdateStmt.Close()
+
+	epInsertStmt, err := tx.Prepare(`
+		INSERT INTO episodes (
+			author, description, episode,
+			file, format, guid,
+			link, published, title,
+			updated, first_seen, last_seen,
+			podcast_title, podcastname_episodename_hash, file_url_hash
+		) VALUES (
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?
+		);`)
+	checkErr(err)
+	defer epInsertStmt.Close()
+
+	interStmt, err := tx.Prepare(interactiveEpisodeUpsertSQL)
+	checkErr(err)
+	defer interStmt.Close()
 
 	for idx := range episodes {
 		// Do some type conversion map[string]interface{} to map[string]string
@@ -332,11 +397,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 		ep[description] = strip.StripTags(ep[description])
 
 		// Is it in the db?
-		rows, err := db.Query(`
-			SELECT count(*) AS COUNT
-			FROM episodes
-			WHERE podcastname_episodename_hash=?
-			;`, podcastNameEpisodenameHash)
+		rows, err := epCountStmt.Query(podcastNameEpisodenameHash)
 		checkErr(err)
 
 		var count int
@@ -354,14 +415,7 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 				log.Println(ep[title], "is already in the db")
 			}
 
-			stmt, err := db.Prepare(`
-				UPDATE episodes
-				SET last_seen = ?
-				WHERE title = ?
-				;`)
-			checkErr(err)
-
-			res, err := stmt.Exec(ts, ep[title])
+			res, err := epUpdateStmt.Exec(ts, ep[title])
 			checkErr(err)
 
 			affected, err := res.RowsAffected()
@@ -376,28 +430,12 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			// Let's do some validation here so we don't put garbage in the database
 			checkStr(pod[title], title)
 
-			stmt, err := db.Prepare(`
-				INSERT INTO episodes (
-					author, description, episode,
-					file, format, guid,
-					link, published, title,
-					updated, first_seen, last_seen,
-					podcast_title, podcastname_episodename_hash, file_url_hash
-				) VALUES (
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?,
-					?, ?, ?
-				);`)
-			checkErr(err)
-
 			// From author ... updated are just the keys in the episode map
 			if verbose {
 				log.Println(ep)
 			}
 
-			res, err := stmt.Exec(
+			res, err := epInsertStmt.Exec(
 				nullWrap(ep[author]),
 				nullWrap(ep[description]),
 				nullWrap(ep[episode]),
@@ -423,46 +461,53 @@ func podEpisodesIntoDatabase(pod map[string]string, episodes []M) {
 			}
 		}
 
-		err = upsertInteractiveEpisodeRecord(db, pod[title], ep, podcastNameEpisodenameHash, fileUrlHash)
+		err = execInteractiveUpsert(interStmt, pod[title], ep, podcastNameEpisodenameHash, fileUrlHash)
 		checkErr(err)
 	}
+
+	checkErr(tx.Commit())
+	committed = true
 }
 
-func upsertInteractiveEpisodeRecord(db *sql.DB, podTitle string, ep map[string]string, podcastNameEpisodenameHash string, fileUrlHash string) error {
-	stmt, err := db.Prepare(`
-		INSERT INTO interactive_episodes (
-			author, description, episode,
-			file, format, guid,
-			link, published, title,
-			updated, first_seen, last_seen,
-			podcast_title, podcastname_episodename_hash, file_url_hash
-		) VALUES (
-			?, ?, ?,
-			?, ?, ?,
-			?, ?, ?,
-			?, ?, ?,
-			?, ?, ?
-		)
-		ON CONFLICT(podcastname_episodename_hash) DO UPDATE SET
-			author = excluded.author,
-			description = excluded.description,
-			episode = excluded.episode,
-			file = excluded.file,
-			format = excluded.format,
-			guid = excluded.guid,
-			link = excluded.link,
-			published = excluded.published,
-			title = excluded.title,
-			updated = excluded.updated,
-			podcast_title = excluded.podcast_title,
-			file_url_hash = excluded.file_url_hash,
-			last_seen = excluded.last_seen
-		;`)
-	if err != nil {
-		return err
-	}
+// interactiveEpisodeUpsertSQL upserts a row into interactive_episodes. It is
+// shared by the batch parse path (prepared once per feed on a *sql.Tx) and by
+// the interactive importer (prepared per call on a *sql.DB), so the two paths
+// stay in lockstep.
+const interactiveEpisodeUpsertSQL = `
+	INSERT INTO interactive_episodes (
+		author, description, episode,
+		file, format, guid,
+		link, published, title,
+		updated, first_seen, last_seen,
+		podcast_title, podcastname_episodename_hash, file_url_hash
+	) VALUES (
+		?, ?, ?,
+		?, ?, ?,
+		?, ?, ?,
+		?, ?, ?,
+		?, ?, ?
+	)
+	ON CONFLICT(podcastname_episodename_hash) DO UPDATE SET
+		author = excluded.author,
+		description = excluded.description,
+		episode = excluded.episode,
+		file = excluded.file,
+		format = excluded.format,
+		guid = excluded.guid,
+		link = excluded.link,
+		published = excluded.published,
+		title = excluded.title,
+		updated = excluded.updated,
+		podcast_title = excluded.podcast_title,
+		file_url_hash = excluded.file_url_hash,
+		last_seen = excluded.last_seen
+	;`
 
-	_, err = stmt.Exec(
+// execInteractiveUpsert runs interactiveEpisodeUpsertSQL against an
+// already-prepared statement (prepared from either a *sql.DB or a *sql.Tx). The
+// argument order matches the placeholders in interactiveEpisodeUpsertSQL.
+func execInteractiveUpsert(stmt *sql.Stmt, podTitle string, ep map[string]string, podcastNameEpisodenameHash string, fileUrlHash string) error {
+	_, err := stmt.Exec(
 		nullWrap(ep[author]),
 		nullWrap(ep[description]),
 		nullWrap(ep[episode]),
@@ -480,6 +525,16 @@ func upsertInteractiveEpisodeRecord(db *sql.DB, podTitle string, ep map[string]s
 		fileUrlHash,
 	)
 	return err
+}
+
+func upsertInteractiveEpisodeRecord(db *sql.DB, podTitle string, ep map[string]string, podcastNameEpisodenameHash string, fileUrlHash string) error {
+	stmt, err := db.Prepare(interactiveEpisodeUpsertSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	return execInteractiveUpsert(stmt, podTitle, ep, podcastNameEpisodenameHash, fileUrlHash)
 }
 
 func storeParsedFeedInInteractiveTable(pod map[string]string, episodes []M) error {
