@@ -335,7 +335,8 @@ func seeWhatPodsWeAlreadyHave(dbFile string, scanPaths []string) mapset.Set {
 // podcastsDir is the primary podcasts directory (and where download_pods.sh is
 // written). scanPaths is the full set of directories to scan when deciding
 // what's already downloaded — typically [podcastsDir, ...archives].
-func generateDownloadList(podcastsDir string, scanPaths []string) {
+// Returns true if there are podcasts to download, false otherwise.
+func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 	hashes := seeWhatPodsWeAlreadyHave(dbFileName, scanPaths)
 
 	log.Println("Pods for download are")
@@ -388,8 +389,7 @@ func generateDownloadList(podcastsDir string, scanPaths []string) {
 
 	if len(lines) == 0 {
 		fmt.Println("Nothing to add to the download script ...")
-		// We don't return here because we want the script to be empty
-		// if there is nothing to download
+		return false
 	} else {
 		fmt.Println("Lines being added to script are ...")
 		printSome(lines)
@@ -405,6 +405,7 @@ func generateDownloadList(podcastsDir string, scanPaths []string) {
 	checkErr(err)
 
 	log.Printf("Written script to %s", filename)
+	return true
 }
 
 func buildNonInteractiveFilename(podcastTitle, episodeTitle, publishedOrFirstSeen, podcastHash string) string {
@@ -965,17 +966,19 @@ Note:
 
 	if *doAll {
 		parseThem(confFilePath)
-		generateDownloadList(podcastsDir, scanPaths)
-		runDownloadScript(podcastsDir)
-		updateDatabaseForDownloads()
-		tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
+		hasDownloads := generateDownloadList(podcastsDir, scanPaths)
+		if hasDownloads {
+			runDownloadScript(podcastsDir)
+			updateDatabaseForDownloads()
+			tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
+		}
 	} else {
 		if *parseOptPtr {
 			parseThem(confFilePath)
 		}
 
 		if *seeOptPtr {
-			generateDownloadList(podcastsDir, scanPaths)
+			_ = generateDownloadList(podcastsDir, scanPaths)
 		}
 
 		if *downloadPods {
