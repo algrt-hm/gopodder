@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/akamensky/argparse"         // akin to Python argparse
@@ -45,6 +46,12 @@ const published = "published"
 const updated = "updated"
 const mp3 = "mp3"
 const eyeD3 = "eyeD3"
+
+// feedParseWorkers bounds how many RSS feeds parseThem fetches concurrently.
+// Feed fetching is network-bound and is by far the dominant cost of a run, so
+// this is the main lever on total runtime. Database writes remain fully
+// serialized regardless of this value: a single consumer drains the results.
+const feedParseWorkers = 10
 
 // These globals will be set in init()
 // Log
@@ -592,16 +599,75 @@ func tagThosePods(podcasts_dir string, pythonPath string, eyeD3Dir string) int {
 	return count
 }
 
-// parseThem parses each of the feeds in the config file
+// parseThem parses each of the feeds in the config file.
+//
+// Feeds are fetched concurrently by a bounded pool of workers because the work
+// is network-bound and each URL is independent. Crucially, the results are
+// consumed by this single goroutine, so every database write still happens one
+// at a time, exactly as in the previous sequential version — SQLite is never
+// touched by more than one goroutine. The error handling is also preserved:
+// checkErr panics (aborting the run) on a non-http error and logs-and-skips on
+// an http error, just as before. The only observable differences are that the
+// "Parsing ..." log lines may now interleave and a fatal error may surface
+// after some other feeds have already been written; the final DB state is
+// identical because every row is keyed by hash/title and every timestamp uses
+// the single global ts, so write order does not matter.
 func parseThem(conf_file_path string) {
 	urls, err := readConfig(conf_file_path + "/" + confFile)
 	checkErr(err)
 
-	for _, url := range urls {
-		podcast, episodes, err := parseFeed(url)
-		checkErr(err)
-		if !isHttpError(err) {
-			podEpisodesIntoDatabase(podcast, episodes)
+	type feedResult struct {
+		podcast  map[string]string
+		episodes []M
+		err      error
+	}
+
+	jobs := make(chan string)
+	results := make(chan feedResult)
+
+	// Never spawn more workers than there are feeds.
+	workers := feedParseWorkers
+	if len(urls) < workers {
+		workers = len(urls)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for url := range jobs {
+				podcast, episodes, parseErr := parseFeed(url)
+				results <- feedResult{podcast, episodes, parseErr}
+			}
+		}()
+	}
+
+	// Hand out the work, then close results once every feed has been fetched.
+	go func() {
+		for _, url := range urls {
+			jobs <- url
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	// One shared DB handle for the whole parse. The consumer below is the only
+	// writer, so cap the pool at a single connection (no SQLite lock contention)
+	// and set a busy timeout as cheap insurance.
+	db, err := sql.Open(sqlite3, dbFileName)
+	checkErr(err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`PRAGMA busy_timeout = 5000;`)
+	checkErr(err)
+
+	// Single consumer => DB writes stay serialized, identical to before.
+	for r := range results {
+		checkErr(r.err)
+		if !isHttpError(r.err) {
+			podEpisodesIntoDatabase(db, r.podcast, r.episodes)
 		}
 	}
 }
@@ -646,13 +712,16 @@ func latestPodsFromDb(path string) {
 		defer db.Close()
 	}
 
-	query := `select 
-	  author, 
-	  title, 
+	query := `select
+	  author,
+	  title,
 	  published,
-	  podcast_title 
-	from episodes 
-	order by published desc 
+	  podcast_title,
+	  IFNULL(published, first_seen),
+	  podcastname_episodename_hash,
+	  file
+	from episodes
+	order by published desc
 	limit 100;`
 
 	rows, err := db.Query(query)
@@ -668,6 +737,9 @@ func latestPodsFromDb(path string) {
 			&latest.title,
 			&latest.published,
 			&latest.podcast_title,
+			&latest.dateForFilename,
+			&latest.hash,
+			&latest.file,
 		)
 		checkErr(err)
 		count += 1
@@ -680,13 +752,33 @@ func latestPodsFromDb(path string) {
 			tsStr = "?"
 		}
 
-		fmt.Printf("%s / %s / %s / %s\n",
+		fmt.Printf("%s / %s / %s / %s / %s\n",
 			tsStr,
 			nullStrToStr(latest.author),
 			nullStrToStr(latest.podcast_title),
 			nullStrToStr(latest.title),
+			expectedFilenameForLatest(latest),
 		)
 	}
+}
+
+// expectedFilenameForLatest derives the filename gopodder would give this
+// episode, matching what -s/--see writes to the download script. Episodes with
+// no file (e.g. transcript-only entries) or no usable date can't be named, so
+// we return "?" to stay consistent with nullStrToStr's convention.
+func expectedFilenameForLatest(latest latestPodResult) string {
+	if !latest.file.Valid || strings.TrimSpace(latest.file.String) == "" {
+		return "?"
+	}
+	if !latest.dateForFilename.Valid || len([]rune(latest.dateForFilename.String)) < 10 {
+		return "?"
+	}
+	return buildNonInteractiveFilename(
+		nullStrToStr(latest.podcast_title),
+		nullStrToStr(latest.title),
+		latest.dateForFilename.String,
+		latest.hash.String,
+	)
 }
 
 // buildScanPaths returns the deduplicated list of directories that

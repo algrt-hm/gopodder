@@ -2,16 +2,18 @@
 
 name = gopodder
 
+go = go125
+
 all: build
 
 format:
-	go fmt *.go
+	$(go) fmt *.go
 
 test:
-	go test ./...
+	$(go) test ./...
 
 build:
-	go121 build -o $(name) *.go
+	$(go) build -o $(name) *.go
 
 interactive: build
 	./$(name) --interactive
