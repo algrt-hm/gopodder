@@ -2,18 +2,18 @@
 
 name = gopodder
 
-go = go125
+GO ?= $(shell [ "$$(uname -s)" = "FreeBSD" ] && echo go125 || echo go)
 
 all: build
 
 format:
-	$(go) fmt *.go
+	$(GO) fmt *.go
 
 test:
-	$(go) test ./...
+	$(GO) test ./...
 
 build:
-	$(go) build -o $(name) *.go
+	$(GO) build -o $(name) *.go
 
 interactive: build
 	./$(name) --interactive
