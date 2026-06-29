@@ -606,13 +606,12 @@ func tagThosePods(podcasts_dir string, pythonPath string, eyeD3Dir string) int {
 // is network-bound and each URL is independent. Crucially, the results are
 // consumed by this single goroutine, so every database write still happens one
 // at a time, exactly as in the previous sequential version — SQLite is never
-// touched by more than one goroutine. The error handling is also preserved:
-// checkErr panics (aborting the run) on a non-http error and logs-and-skips on
-// an http error, just as before. The only observable differences are that the
-// "Parsing ..." log lines may now interleave and a fatal error may surface
-// after some other feeds have already been written; the final DB state is
-// identical because every row is keyed by hash/title and every timestamp uses
-// the single global ts, so write order does not matter.
+// touched by more than one goroutine. A single feed that fails to fetch or
+// parse (network timeout, bad HTTP status, malformed XML) is logged and
+// skipped rather than aborting the whole batch, so one flaky feed can't stop
+// the rest from being downloaded. The "Parsing ..." log lines may interleave;
+// the final DB state is independent of write order because every row is keyed
+// by hash/title and every timestamp uses the single global ts.
 func parseThem(conf_file_path string) {
 	urls, err := readConfig(conf_file_path + "/" + confFile)
 	checkErr(err)
@@ -666,10 +665,16 @@ func parseThem(conf_file_path string) {
 
 	// Single consumer => DB writes stay serialized, identical to before.
 	for r := range results {
-		checkErr(r.err)
-		if !isHttpError(r.err) {
-			podEpisodesIntoDatabase(db, r.podcast, r.episodes)
+		// A single feed failing to fetch or parse — TLS/handshake timeout,
+		// connection refused, DNS failure, a bad HTTP status, malformed XML —
+		// must never abort the whole batch. (Previously checkErr panicked on
+		// any error whose text didn't contain "http error", so one flaky feed
+		// killed the entire run.) Log it and move on; the next run retries it.
+		if r.err != nil {
+			log.Printf("Skipping feed: %s", r.err)
+			continue
 		}
+		podEpisodesIntoDatabase(db, r.podcast, r.episodes)
 	}
 }
 
