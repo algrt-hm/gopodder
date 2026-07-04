@@ -220,6 +220,44 @@ func fetchDbEpisodeHashes(dbFile string) (dbHashSet, transformedTitlesSet mapset
 	return
 }
 
+// fetchLegacyURLHashMap returns a map from file_url_hash to
+// podcastname_episodename_hash for every episode in the db. Files downloaded
+// under the legacy filename scheme carry the file-URL hash in their name, so
+// this map lets us recognise them as already-downloaded episodes.
+func fetchLegacyURLHashMap(dbFile string) map[string]string {
+	urlHashToEpisodeHash := make(map[string]string)
+
+	db, err := sql.Open(sqlite3, dbFile)
+	checkErr(err)
+
+	if err == nil {
+		defer db.Close()
+	}
+
+	query := `SELECT file_url_hash, podcastname_episodename_hash FROM episodes WHERE file_url_hash IS NOT NULL AND file_url_hash != '';`
+	rows, err := db.Query(query)
+	checkErr(err)
+
+	for rows.Next() {
+		var urlHash, episodeHash string
+		err = rows.Scan(&urlHash, &episodeHash)
+		checkErr(err)
+		urlHashToEpisodeHash[urlHash] = episodeHash
+	}
+	return urlHashToEpisodeHash
+}
+
+// addEpisodeHashesForLegacyFiles adds the corresponding episode hash for any
+// member of hashes that is actually a legacy file-URL hash, so that files
+// named under the legacy scheme count as having their episode present.
+func addEpisodeHashesForLegacyFiles(hashes mapset.Set, urlHashToEpisodeHash map[string]string) {
+	for _, v := range hashes.ToSlice() {
+		if episodeHash, ok := urlHashToEpisodeHash[fmt.Sprintf("%v", v)]; ok {
+			hashes.Add(episodeHash)
+		}
+	}
+}
+
 // matchByTransformedTitle removes hashes from candidates where the transformed title
 // matches an existing filename via substring search.
 func matchByTransformedTitle(candidates mapset.Set, ttToHashes map[string]string, filenamesSlice []interface{}, ttsInFileNames mapset.Set) {
@@ -267,6 +305,14 @@ func seeWhatPodsWeAlreadyHave(dbFile string, scanPaths []string) mapset.Set {
 
 	// Fetch DB episode hashes
 	dbHashSet, _, hashesToEpInfo, dbTTToHashes, dbHashesToTT := fetchDbEpisodeHashes(dbFile)
+
+	// Files downloaded before the episode-hash filename scheme are named with
+	// the md5 of the file URL instead. Translate any such hash (on disk or in
+	// the archive registry) to its episode hash so those episodes count as
+	// already downloaded rather than being fetched again.
+	urlHashToEpisodeHash := fetchLegacyURLHashMap(dbFile)
+	addEpisodeHashesForLegacyFiles(fileHashSet, urlHashToEpisodeHash)
+	addEpisodeHashesForLegacyFiles(archivedHashSet, urlHashToEpisodeHash)
 
 	// Merge maps: DB entries take priority for tt<->hash mappings used in matching
 	for tt, hash := range localTTToHashes {

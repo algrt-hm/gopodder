@@ -331,6 +331,136 @@ func TestGenerateDownloadListKeepsNewEpisodesWithCollidingTransformedTitles(t *t
 	}
 }
 
+func TestLegacyURLHashFilenamesExcludedFromDownloadList(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Legacy Show"
+	legacyTitle := "Old Episode"
+	freshTitle := "New Episode"
+
+	legacyEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+legacyTitle)))
+	freshEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+freshTitle)))
+	legacyURL := "https://example.com/old.mp3"
+	freshURL := "https://example.com/new.mp3"
+	legacyURLHash := fmt.Sprintf("%x", md5.Sum([]byte(legacyURL)))
+	freshURLHash := fmt.Sprintf("%x", md5.Sum([]byte(freshURL)))
+
+	// The legacy episode exists on disk under the old filename scheme:
+	// named with the file-URL hash, not the episode hash.
+	legacyFilename := buildEpisodeFilenameWithHash(podcastTitle, legacyTitle, "2020-01-01", legacyURLHash)
+	if err := os.WriteFile(filepath.Join(tmpDir, legacyFilename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	// A new-scheme file must also be present, otherwise the transformed-title
+	// fallback kicks in and masks the hash-matching path under test.
+	otherTitle := "Other Episode"
+	otherEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+otherTitle)))
+	otherURL := "https://example.com/other.mp3"
+	otherURLHash := fmt.Sprintf("%x", md5.Sum([]byte(otherURL)))
+	otherFilename := buildEpisodeFilenameWithHash(podcastTitle, otherTitle, "2023-01-01", otherEpisodeHash)
+	if err := os.WriteFile(filepath.Join(tmpDir, otherFilename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write other file: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		legacyTitle, "2020-01-01T00:00:00Z", ts, ts, podcastTitle, legacyEpisodeHash, legacyURLHash, legacyURL,
+		otherTitle, "2023-01-01T00:00:00Z", ts, ts, podcastTitle, otherEpisodeHash, otherURLHash, otherURL,
+		freshTitle, "2024-01-02T00:00:00Z", ts, ts, podcastTitle, freshEpisodeHash, freshURLHash, freshURL,
+	)
+	if err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	script, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err != nil {
+		t.Fatalf("read download script: %v", err)
+	}
+	text := string(script)
+	if !strings.Contains(text, freshURL) {
+		t.Fatalf("expected fresh URL %q in download script, got %q", freshURL, text)
+	}
+	if strings.Contains(text, legacyURL) {
+		t.Fatalf("expected legacy-named episode URL %q to be EXCLUDED from download script, got %q", legacyURL, text)
+	}
+}
+
+func TestLegacyURLHashInArchiveRegistryExcludedFromDownloadList(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Legacy Archive Show"
+	archivedTitle := "Archived Legacy Episode"
+	freshTitle := "Fresh Episode"
+
+	archivedEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+archivedTitle)))
+	freshEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+freshTitle)))
+	archivedURL := "https://example.com/archived-legacy.mp3"
+	freshURL := "https://example.com/fresh.mp3"
+	archivedURLHash := fmt.Sprintf("%x", md5.Sum([]byte(archivedURL)))
+	freshURLHash := fmt.Sprintf("%x", md5.Sum([]byte(freshURL)))
+
+	if _, err := db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		archivedTitle, "2020-01-01T00:00:00Z", ts, ts, podcastTitle, archivedEpisodeHash, archivedURLHash, archivedURL,
+		freshTitle, "2024-01-02T00:00:00Z", ts, ts, podcastTitle, freshEpisodeHash, freshURLHash, freshURL,
+	); err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	// Registering a legacy-named archived file stores the URL hash parsed
+	// from its filename, not the episode hash.
+	if _, err := db.Exec(`
+		INSERT INTO archived_episodes (podcastname_episodename_hash, archived_path, archived_at)
+		VALUES (?, ?, ?)
+		;`, archivedURLHash, "/some/archive/path/archived-legacy.mp3", ts); err != nil {
+		t.Fatalf("insert archived row: %v", err)
+	}
+
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	script, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err != nil {
+		t.Fatalf("read script: %v", err)
+	}
+	text := string(script)
+	if !strings.Contains(text, freshURL) {
+		t.Fatalf("expected fresh URL %q in download script, got %q", freshURL, text)
+	}
+	if strings.Contains(text, archivedURL) {
+		t.Fatalf("expected legacy-hash archived URL %q to be EXCLUDED from download script, got %q", archivedURL, text)
+	}
+}
+
 func TestScanLocalPodFilesUnionsAcrossPaths(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
