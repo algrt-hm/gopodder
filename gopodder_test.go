@@ -695,3 +695,216 @@ func TestCheckErrHttpErrorDoesNotPanic(t *testing.T) {
 	}()
 	checkErr(fmt.Errorf("http error: 404 Not Found"))
 }
+
+func TestNameMinusHash(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wantOk bool
+	}{
+		{"My_Podcast-2024-01-02-Episode_Title-abc123def.mp3", "My_Podcast-2024-01-02-Episode_Title", true},
+		{"A-2020-01-01-B-ffff.mp3", "A-2020-01-01-B", true},
+		{"no_extension-abc123", "", false},
+		{"nodash.mp3", "", false},
+	}
+	for _, c := range cases {
+		got, ok := nameMinusHash(c.in)
+		if ok != c.wantOk || got != c.want {
+			t.Fatalf("nameMinusHash(%q) = %q, %v; want %q, %v", c.in, got, ok, c.want, c.wantOk)
+		}
+	}
+}
+
+// An episode whose only surviving copy is named with the hash of a URL the
+// feed has since rotated away from (so episodes.file_url_hash no longer
+// matches the filename hash) must still be excluded from the download list.
+// This is the 2026-07-05 incident scenario.
+func TestRotatedURLHashTwinOnDiskExcludedFromDownloadList(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Rotating Show"
+	twinTitle := "Stale URL Episode"
+	freshTitle := "Genuinely New Episode"
+
+	twinEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+twinTitle)))
+	freshEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+freshTitle)))
+	currentURL := "https://example.com/current-token.mp3"
+	currentURLHash := fmt.Sprintf("%x", md5.Sum([]byte(currentURL)))
+	freshURL := "https://example.com/fresh.mp3"
+	freshURLHash := fmt.Sprintf("%x", md5.Sum([]byte(freshURL)))
+
+	// On disk the twin is named with the hash of a URL from years ago, which
+	// matches neither the episode hash nor the current file_url_hash.
+	staleURLHash := fmt.Sprintf("%x", md5.Sum([]byte("https://example.com/token-from-2019.mp3")))
+	twinFilename := buildEpisodeFilenameWithHash(podcastTitle, twinTitle, "2019-06-01", staleURLHash)
+	if err := os.WriteFile(filepath.Join(tmpDir, twinFilename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write twin file: %v", err)
+	}
+
+	// A new-scheme file so the all-or-nothing transformed-title fallback stays out of the way.
+	otherTitle := "Other Episode"
+	otherEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+otherTitle)))
+	otherFilename := buildEpisodeFilenameWithHash(podcastTitle, otherTitle, "2023-01-01", otherEpisodeHash)
+	if err := os.WriteFile(filepath.Join(tmpDir, otherFilename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write other file: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		twinTitle, "2019-06-01T00:00:00Z", ts, ts, podcastTitle, twinEpisodeHash, currentURLHash, currentURL,
+		freshTitle, "2024-01-02T00:00:00Z", ts, ts, podcastTitle, freshEpisodeHash, freshURLHash, freshURL,
+	)
+	if err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	script, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err != nil {
+		t.Fatalf("read download script: %v", err)
+	}
+	text := string(script)
+	if !strings.Contains(text, freshURL) {
+		t.Fatalf("expected fresh URL %q in download script, got %q", freshURL, text)
+	}
+	if strings.Contains(text, currentURL) {
+		t.Fatalf("expected rotated-URL twin %q to be EXCLUDED from download script, got %q", currentURL, text)
+	}
+}
+
+// Same scenario, but the twin's only trace is an archived_episodes row whose
+// archived_path basename carries the stale hash — the file itself is on an
+// unmounted volume and no scan path can see it.
+func TestRotatedURLHashTwinInRegistryExcludedFromDownloadList(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Rotating Show"
+	twinTitle := "Archived Stale URL Episode"
+
+	twinEpisodeHash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+twinTitle)))
+	currentURL := "https://example.com/current-token-2.mp3"
+	currentURLHash := fmt.Sprintf("%x", md5.Sum([]byte(currentURL)))
+
+	staleURLHash := fmt.Sprintf("%x", md5.Sum([]byte("https://example.com/token-from-2020.mp3")))
+	twinFilename := buildEpisodeFilenameWithHash(podcastTitle, twinTitle, "2020-03-01", staleURLHash)
+
+	_, err = db.Exec(
+		`INSERT INTO archived_episodes (podcastname_episodename_hash, archived_path, archived_at) VALUES (?, ?, ?);`,
+		staleURLHash, "/unmounted/archive/"+twinFilename, ts,
+	)
+	if err != nil {
+		t.Fatalf("insert archive row: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		twinTitle, "2020-03-01T00:00:00Z", ts, ts, podcastTitle, twinEpisodeHash, currentURLHash, currentURL,
+	)
+	if err != nil {
+		t.Fatalf("insert episode: %v", err)
+	}
+
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	script, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err == nil && strings.Contains(string(script), currentURL) {
+		t.Fatalf("expected registry twin %q to be EXCLUDED from download script, got %q", currentURL, string(script))
+	}
+}
+
+// Two distinct episodes published the SAME day whose titles differ only in
+// digits ("Part 1"/"Part 2") collapse to one name-minus-hash prefix, because
+// titleTransformation strips digits. The twin backstop must NOT treat Part 2's
+// file as a copy of Part 1: an ambiguous prefix (owned by more than one
+// episode in the db) never suppresses a download. This is the real
+// "The Deobandis" pair the 2026-07-04 dedup run conflated.
+func TestSameDayDigitCollidingEpisodesStillDownloaded(t *testing.T) {
+	tmpDir := useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	podcastTitle := "Analysis Show"
+	part1Title := "The Deobandis: Part 1"
+	part2Title := "The Deobandis: Part 2"
+
+	part1Hash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+part1Title)))
+	part2Hash := fmt.Sprintf("%x", md5.Sum([]byte(podcastTitle+part2Title)))
+	part1URL := "https://example.com/deobandis-1.mp3"
+	part2URL := "https://example.com/deobandis-2.mp3"
+	part1URLHash := fmt.Sprintf("%x", md5.Sum([]byte(part1URL)))
+	part2URLHash := fmt.Sprintf("%x", md5.Sum([]byte(part2URL)))
+
+	// Part 2 is on disk under its canonical episode-hash name; Part 1 is not.
+	part2Filename := buildEpisodeFilenameWithHash(podcastTitle, part2Title, "2016-04-14", part2Hash)
+	if err := os.WriteFile(filepath.Join(tmpDir, part2Filename), []byte("existing"), 0666); err != nil {
+		t.Fatalf("write part2 file: %v", err)
+	}
+
+	// Sanity: the two canonical filenames must actually share a prefix,
+	// otherwise this test isn't exercising the ambiguity guard.
+	part1Filename := buildEpisodeFilenameWithHash(podcastTitle, part1Title, "2016-04-14", part1Hash)
+	nmh1, ok1 := nameMinusHash(part1Filename)
+	nmh2, ok2 := nameMinusHash(part2Filename)
+	if !ok1 || !ok2 || nmh1 != nmh2 {
+		t.Fatalf("expected colliding prefixes, got %q vs %q", nmh1, nmh2)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO episodes (
+			title, published, first_seen, last_seen, podcast_title,
+			podcastname_episodename_hash, file_url_hash, file
+		) VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?, ?, ?, ?)
+		;`,
+		part1Title, "2016-04-14T10:08:00Z", ts, ts, podcastTitle, part1Hash, part1URLHash, part1URL,
+		part2Title, "2016-04-14T10:22:00Z", ts, ts, podcastTitle, part2Hash, part2URLHash, part2URL,
+	)
+	if err != nil {
+		t.Fatalf("insert episodes: %v", err)
+	}
+
+	generateDownloadList(tmpDir, []string{tmpDir})
+
+	script, err := os.ReadFile(filepath.Join(tmpDir, "download_pods.sh"))
+	if err != nil {
+		t.Fatalf("read download script: %v", err)
+	}
+	text := string(script)
+	if !strings.Contains(text, part1URL) {
+		t.Fatalf("expected Part 1 URL %q in download script despite prefix collision, got %q", part1URL, text)
+	}
+	if strings.Contains(text, part2URL) {
+		t.Fatalf("expected Part 2 (present on disk) to be excluded, got %q", text)
+	}
+}

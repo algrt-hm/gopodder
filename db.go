@@ -124,11 +124,9 @@ func createTablesIfNotExist() {
 	ON episodes (file_url_hash);
 	`
 
-	// podEpisodesIntoDatabase updates last_seen with `WHERE title = ?` on every
-	// already-known episode, every run. Without this index that is a full table
-	// scan per episode (~23k scans of ~23k rows = the dominant cost of a parse:
-	// ~19 min of pread() syscalls). With it the update is an index lookup and the
-	// whole parse drops from ~25 min to seconds.
+	// The last_seen refresh in podEpisodesIntoDatabase now updates by primary
+	// key, so this index is no longer needed for the parse hot path; kept for
+	// ad-hoc title lookups.
 	createEpisodesTitleIdx := `
 	CREATE INDEX IF NOT EXISTS idx_episodes_title
 	ON episodes (title);
@@ -340,10 +338,15 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 	checkErr(err)
 	defer epCountStmt.Close()
 
+	// Refresh last_seen by primary key. Matching on title alone (as this used
+	// to) refreshed every same-titled row across ALL podcasts — retitled
+	// podcasts' leftover rows (e.g. "Aufhebunga Bunga (Patreon)" after the
+	// feed became "Bungacast") were kept looking feed-fresh forever, which
+	// broke any logic using last_seen to tell live rows from stale ones.
 	epUpdateStmt, err := tx.Prepare(`
 		UPDATE episodes
 		SET last_seen = ?
-		WHERE title = ?
+		WHERE podcastname_episodename_hash = ?
 		;`)
 	checkErr(err)
 	defer epUpdateStmt.Close()
@@ -415,7 +418,7 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 				log.Println(ep[title], "is already in the db")
 			}
 
-			res, err := epUpdateStmt.Exec(ts, ep[title])
+			res, err := epUpdateStmt.Exec(ts, podcastNameEpisodenameHash)
 			checkErr(err)
 
 			affected, err := res.RowsAffected()

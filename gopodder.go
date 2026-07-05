@@ -124,6 +124,48 @@ func hashFromFilename(filename string) (string, string, error) {
 	return hash, transformedTitle, nil
 }
 
+// nameMinusHash strips the trailing -<hash>.mp3 from a podcast filename,
+// returning the Podcast-YYYY-MM-DD-Title prefix that identifies an episode
+// regardless of which hash scheme (file-URL era or episode) named the file.
+func nameMinusHash(filename string) (string, bool) {
+	base := strings.TrimSuffix(filename, "."+mp3)
+	if base == filename {
+		return "", false
+	}
+	i := strings.LastIndex(base, "-")
+	if i <= 0 {
+		return "", false
+	}
+	return base[:i], true
+}
+
+// fetchHaveNamesMinusHash unions the name-minus-hash prefixes of every podcast
+// file visible on the scan paths or registered in archived_episodes. Episode
+// hashes changed schemes over time (md5 of a long-rotated file URL vs md5 of
+// titles), so the prefix is the only stable identity a twin under an old hash
+// shares with the canonical filename. Prefix equality includes podcast and
+// publication date, so the digit-stripping in titleTransformation cannot
+// conflate e.g. "Part 1"/"Part 2" episodes published on different days.
+func fetchHaveNamesMinusHash(scanPaths []string) mapset.Set {
+	out := mapset.NewSet()
+	add := func(name string) {
+		if nmh, ok := nameMinusHash(name); ok {
+			out.Add(nmh)
+		}
+	}
+	for _, path := range scanPaths {
+		names, err := archiveCandidatesInDir(path)
+		checkErr(err)
+		for _, name := range names {
+			add(name)
+		}
+	}
+	for _, name := range fetchArchivedBasenames() {
+		add(name)
+	}
+	return out
+}
+
 // sensibleFilesInDir returns a set of filenames that we identify as podcasts
 // Assumes .mp3 only
 func sensibleFilesInDir(path string) mapset.Set {
@@ -407,18 +449,61 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 	filenames := make([]string, 0)
 	urls := make([]string, 0)
 
+	// Twin backstop: episodes whose only surviving copy sits under an old
+	// hash (a rotated file URL, or a keeper the dedup script left legacy-
+	// named) share their Podcast-date-Title prefix with the canonical
+	// filename even though no hash matches. Without this, such episodes are
+	// re-downloaded en masse — see the 2026-03-15 and 2026-07-05 incidents.
+	//
+	// The prefix is only trustworthy when a single episode owns it.
+	// titleTransformation strips digits, so "Part 1"/"Part 2" published the
+	// same day collapse to one prefix ("The Deobandis" case); skipping on an
+	// ambiguous prefix would silently never download one of the parts. Two
+	// passes: first count distinct episodes per prefix, then skip only on
+	// prefixes with exactly one owner.
+	haveNamesMinusHash := fetchHaveNamesMinusHash(scanPaths)
+
+	type episodeRow struct {
+		podcastTitle, published, title, episodeHash, file string
+	}
+	episodeRows := make([]episodeRow, 0)
+	prefixOwners := make(map[string]map[string]bool)
+
 	for rows.Next() {
 		// Data from db
 		var podcastTitle, published, title, podcastNameEpisodenameHash, fileUrlHash, file string
 		err = rows.Scan(&podcastTitle, &published, &title, &podcastNameEpisodenameHash, &fileUrlHash, &file)
 		checkErr(err)
+		_ = fileUrlHash
 
-		// If file_url_hash in hashes ...
-		if hashes.Contains(podcastNameEpisodenameHash) {
-			newFilename := buildNonInteractiveFilename(podcastTitle, title, published, podcastNameEpisodenameHash)
-			filenames = append(filenames, newFilename)
-			urls = append(urls, file)
+		episodeRows = append(episodeRows, episodeRow{podcastTitle, published, title, podcastNameEpisodenameHash, file})
+
+		canonical := buildNonInteractiveFilename(podcastTitle, title, published, podcastNameEpisodenameHash)
+		if nmh, ok := nameMinusHash(canonical); ok {
+			if prefixOwners[nmh] == nil {
+				prefixOwners[nmh] = make(map[string]bool)
+			}
+			prefixOwners[nmh][podcastNameEpisodenameHash] = true
 		}
+	}
+
+	twinsSkipped := 0
+	for _, row := range episodeRows {
+		// If file_url_hash in hashes ...
+		if hashes.Contains(row.episodeHash) {
+			newFilename := buildNonInteractiveFilename(row.podcastTitle, row.title, row.published, row.episodeHash)
+			if nmh, ok := nameMinusHash(newFilename); ok && haveNamesMinusHash.Contains(nmh) && len(prefixOwners[nmh]) == 1 {
+				log.Printf("skipping %s: already have a copy under another hash", newFilename)
+				twinsSkipped++
+				continue
+			}
+			filenames = append(filenames, newFilename)
+			urls = append(urls, row.file)
+		}
+	}
+
+	if twinsSkipped > 0 {
+		log.Printf("skipped %d episode(s) already present under another hash", twinsSkipped)
 	}
 
 	// some output to keep user informed
@@ -901,6 +986,22 @@ Typical use:
 	                            downloaded files (mounted alternative to the
 	                            registry above).
 
+	Deduplication (same episode under different filename hashes):
+	--dedup-twins               Dry run: plan removal of duplicate copies
+	                            across the podcasts dir and archive scan
+	                            paths, keeping one copy per episode under
+	                            its canonical episode-hash filename.
+	--dedup-twins-delete        Apply the plan, maintaining the downloads
+	                            and archived_episodes tables as it goes.
+	--prune-stale-episodes      Dry run: list stale fileless episodes rows
+	                            (retitle debris) that would re-queue deleted
+	                            twin variants for download.
+	--prune-stale-episodes-delete  Apply it.
+	--dedup-retitles            Dry run: plan merging duplicates split across
+	                            a podcast RENAME (old vs new podcast title),
+	                            which the twin pass cannot see.
+	--dedup-retitles-delete     Apply it.
+
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
 	will save pods into %s; and
@@ -928,6 +1029,12 @@ Note:
 	registerArchiveOpt := parser.String("", "register-archive", &argparse.Options{Required: false, Help: "Register podcast files in <dir> as archived (won't be re-downloaded even if dir is unmounted)"})
 	unregisterArchiveOpt := parser.String("", "unregister-archive", &argparse.Options{Required: false, Help: "Remove archive registrations matching files currently in <dir>"})
 	reconcileArchiveOpt := parser.Flag("", "reconcile-archive", &argparse.Options{Required: false, Help: "Drop archive registrations whose archived path no longer resolves on disk"})
+	dedupTwinsOpt := parser.Flag("", "dedup-twins", &argparse.Options{Required: false, Help: "Dry run: plan removal of duplicate copies of episodes across podcasts dir and archive scan paths"})
+	dedupTwinsDeleteOpt := parser.Flag("", "dedup-twins-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-twins plan (deletes files; updates downloads and archived_episodes)"})
+	pruneStaleOpt := parser.Flag("", "prune-stale-episodes", &argparse.Options{Required: false, Help: "Dry run: list stale fileless episodes rows that would re-queue deleted twin variants for download"})
+	pruneStaleDeleteOpt := parser.Flag("", "prune-stale-episodes-delete", &argparse.Options{Required: false, Help: "Apply the --prune-stale-episodes plan (deletes episodes rows)"})
+	dedupRetitlesOpt := parser.Flag("", "dedup-retitles", &argparse.Options{Required: false, Help: "Dry run: plan merging duplicate copies split across a podcast rename (old vs new podcast title prefixes)"})
+	dedupRetitlesDeleteOpt := parser.Flag("", "dedup-retitles-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-retitles plan"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -998,6 +1105,18 @@ Note:
 		n, err := reconcileArchiveRegistry()
 		checkErr(err)
 		log.Printf("removed %d stale archive registration(s)", n)
+		return
+	}
+	if *dedupTwinsOpt || *dedupTwinsDeleteOpt {
+		checkErr(runDedupTwins(scanPaths, *dedupTwinsDeleteOpt))
+		return
+	}
+	if *pruneStaleOpt || *pruneStaleDeleteOpt {
+		checkErr(pruneStaleEpisodes(scanPaths, *pruneStaleDeleteOpt))
+		return
+	}
+	if *dedupRetitlesOpt || *dedupRetitlesDeleteOpt {
+		checkErr(runDedupRetitles(scanPaths, *dedupRetitlesDeleteOpt))
 		return
 	}
 

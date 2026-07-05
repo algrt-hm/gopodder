@@ -215,3 +215,33 @@ func fetchArchivedHashes() mapset.Set {
 	}
 	return out
 }
+
+// fetchArchivedBasenames returns the basename of every archived_path in
+// archived_episodes. These feed name-minus-hash matching, so an episode whose
+// only surviving copy is a legacy-named archive file still counts as "already
+// have" even when the archive volume is unmounted.
+func fetchArchivedBasenames() []string {
+	out := make([]string, 0)
+	db, err := sql.Open(sqlite3, dbFileName)
+	checkErr(err)
+	if err == nil {
+		defer db.Close()
+	}
+	rows, err := db.Query(`SELECT archived_path FROM archived_episodes WHERE archived_path IS NOT NULL AND archived_path != '';`)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return out
+		}
+		checkErr(err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			checkErr(err)
+		}
+		out = append(out, filepath.Base(p))
+	}
+	return out
+}
