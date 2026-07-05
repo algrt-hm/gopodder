@@ -57,6 +57,7 @@ type dedupOwner struct {
 	title        string
 	published    string // IFNULL(published, first_seen), never empty
 	lastSeen     string
+	guid         string
 	interactive  bool
 }
 
@@ -104,7 +105,7 @@ func loadDedupOwners(dbFile string) (map[string]dedupOwner, map[string]string, e
 
 	load := func(table string, interactive bool) error {
 		q := fmt.Sprintf(`SELECT podcastname_episodename_hash, podcast_title, title,
-			IFNULL(published, first_seen), last_seen, IFNULL(file_url_hash, '')
+			IFNULL(published, first_seen), last_seen, IFNULL(file_url_hash, ''), IFNULL(guid, '')
 			FROM %s;`, table)
 		rows, err := db.Query(q)
 		if err != nil {
@@ -114,7 +115,7 @@ func loadDedupOwners(dbFile string) (map[string]dedupOwner, map[string]string, e
 		for rows.Next() {
 			var o dedupOwner
 			var urlHash string
-			if err := rows.Scan(&o.epHash, &o.podcastTitle, &o.title, &o.published, &o.lastSeen, &urlHash); err != nil {
+			if err := rows.Scan(&o.epHash, &o.podcastTitle, &o.title, &o.published, &o.lastSeen, &urlHash, &o.guid); err != nil {
 				return err
 			}
 			o.interactive = interactive
@@ -918,4 +919,115 @@ func runDedupRetitles(scanPaths []string, apply bool) error {
 	}
 	actions := planRetitles(files, owners, url2ep, podLastSeen, time.Now())
 	return executeDedupPlan(actions, scanPaths, apply, "--dedup-retitles-delete")
+}
+
+// GUID pass: merge duplicate copies of episodes that a podcast retitled
+// (same feed guid, different episode hash). Neither earlier pass sees these:
+// the twin pass groups by filename prefix, which a retitle changes, and the
+// retitle pass handles whole-podcast renames, not per-episode ones. This is
+// the cleanup counterpart of the download-time guard in skip.go, for the
+// copies that were downloaded before that guard existed (the 2026-07-05
+// incident left 3-6 copies of most 2026 Knowledge Project episodes).
+//
+// The guid is the feed's own episode identity and is stable across every
+// retitle observed in this db, including ones that also shift the published
+// date. As a hedge against a feed that abuses guids, a row only merges when
+// something corroborates it being the same episode: same published date, or
+// matching titles (sameEpisodeTitles or materialTitleOverlap). Groups
+// failing that are reported MANUAL and left alone.
+
+// planGuidDedup builds the merge plan for same-(podcast, guid) duplicates.
+// Pure, like planDedup.
+func planGuidDedup(files []dedupFile, owners map[string]dedupOwner, url2ep map[string]string) []dedupAction {
+	// Attribute files to episodes where the db allows
+	filesByEp := make(map[string][]dedupFile)
+	for _, f := range files {
+		if _, ok := owners[f.hash]; ok {
+			f.epHash = f.hash
+		} else if ep, ok := url2ep[f.hash]; ok {
+			f.epHash = ep
+		}
+		if f.epHash != "" {
+			filesByEp[f.epHash] = append(filesByEp[f.epHash], f)
+		}
+	}
+
+	// Group owner rows by (podcast, guid)
+	groups := make(map[string][]dedupOwner)
+	for _, o := range owners {
+		if o.guid == "" {
+			continue
+		}
+		k := o.podcastTitle + "\x00" + o.guid
+		groups[k] = append(groups[k], o)
+	}
+	keys := make([]string, 0, len(groups))
+	for k, rows := range groups {
+		if len(rows) > 1 {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	date10 := func(s string) string {
+		if len(s) >= 10 {
+			return s[:10]
+		}
+		return s
+	}
+
+	actions := make([]dedupAction, 0)
+	for _, k := range keys {
+		rows := groups[k]
+
+		// The identity to keep is the row the feed refreshed most recently:
+		// its title is (closest to) what the feed currently uses.
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].lastSeen != rows[j].lastSeen {
+				return rows[i].lastSeen > rows[j].lastSeen
+			}
+			return rows[i].epHash < rows[j].epHash
+		})
+		target := rows[0]
+
+		group := make([]dedupFile, 0, 4)
+		group = append(group, filesByEp[target.epHash]...)
+		for _, o := range rows[1:] {
+			corroborated := date10(o.published) == date10(target.published) ||
+				sameEpisodeTitles(o.title, target.title) ||
+				materialTitleOverlap(o.title, target.title)
+			if !corroborated {
+				for _, f := range filesByEp[o.epHash] {
+					actions = append(actions, dedupAction{kind: actManual, file: f,
+						reason: fmt.Sprintf("guid group but no date/title corroboration (%q vs %q)", o.title, target.title)})
+				}
+				continue
+			}
+			for _, f := range filesByEp[o.epHash] {
+				if !o.interactive {
+					f.pruneEp = o.epHash
+				}
+				group = append(group, f)
+			}
+		}
+		if len(group) == 0 {
+			continue
+		}
+		dedupCopies(group, target.epHash, canonicalNameFor(target), &actions)
+	}
+	return actions
+}
+
+// runDedupGuid gathers files, plans the guid merges, and executes.
+func runDedupGuid(scanPaths []string, apply bool) error {
+	owners, url2ep, err := loadDedupOwners(dbFileName)
+	if err != nil {
+		return err
+	}
+	files, err := gatherDedupFiles(scanPaths)
+	if err != nil {
+		return err
+	}
+	actions := planGuidDedup(files, owners, url2ep)
+	return executeDedupPlan(actions, scanPaths, apply, "--dedup-guid-delete")
 }

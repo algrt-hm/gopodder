@@ -1,5 +1,27 @@
 # Bugs found
 
+## Retitled episodes re-downloaded (2026-07-05)
+
+The 18:05 run downloaded four "new" Knowledge Project episodes dated March–April 2026:
+
+```
+./gopodder 2026/07/05 18:06:04 gopodder.go:430: Pods for download are
+The_Knowledge_Project-2026-04-22-Ai_Goes_Parabolic_OpenAI_Co_Founder_Greg_Brockman-abc3f058....mp3
+The_Knowledge_Project-2026-04-14-The_Magic_of_Thinking_Big_Xpo_Ceo_Mario_Harik-0a339d3c....mp3
+...
+```
+
+All four were retitles of episodes already on disk under 3–5 other names each (The Knowledge Project retitles episodes repeatedly; ~900MB of duplicates in this run alone). The episode hash is an MD5 of podcast title + episode title, so every retitle mints a new hash, and the prefix twin backstop only catches identical titles.
+
+The db already held the answer: the feed `guid` is stable across every retitle, 100% populated (19,699/19,699 rows), and same-(podcast, guid) groups across the whole db were all confirmed retitles (~340 redundant rows over 31 shows; The Econoclasts alone had 128).
+
+Fixes:
+
+- `skip.go`: download-time guard — skip when a same-(podcast, guid) sibling already has a file, or (for guid-rotating feeds) same podcast + date + materially overlapping title, digit-guarded so "Part 1"/"Part 2" and same-day daily-feed episodes never merge. Skips are recorded in the new `skipped_episodes` table.
+- `--dedup-guid` / `--dedup-guid-delete`: cleanup pass merging the historical copies (dry-run plan on 2026-07-05: 318 duplicates + 33 stubs, 24 GiB reclaimable, 6 MANUAL holds for retitles that also shifted the published date).
+
+Verified by replaying the pre-run state: the guard skips exactly the four duplicates and still downloads the genuinely new episode from the same run.
+
 ## `NULL` `podcast_title`
 
 Somehow adding an empty new podcast

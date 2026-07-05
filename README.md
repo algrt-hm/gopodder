@@ -145,6 +145,31 @@ The two mechanisms compose: registered hashes are always treated as "have"; moun
 
 The interactive picker also marks episodes as already-downloaded if they are in either `downloads` or `archived_episodes`.
 
+### Retitled episodes and deduplication
+
+Some feeds republish the same episode under a new title, repeatedly in the worst cases. Because episodes are keyed on an MD5 of `podcast_title` + `episode_title`, a retitle looks like a brand-new episode and would be downloaded again.
+
+Two defences exist:
+
+1. **Download-time guard** (automatic, part of `-s`/`-a`): before an episode is added to the download script, it is skipped if another row with the same feed `guid` already has a file — the guid is the feed's own episode identity and is stable across retitles. A fallback catches guid-rotating feeds: same podcast, same published date, and materially overlapping titles (guarded so that "Part 1"/"Part 2" siblings and same-day episodes of daily feeds are never merged). Every skip is logged and recorded in the `skipped_episodes` table with the reason and the matched episode, so refusals are auditable:
+
+    ``` sql
+    select * from skipped_episodes order by last_skipped desc;
+    ```
+
+2. **Cleanup passes** (one-shot commands, dry-run by default) for duplicates that are already on disk:
+
+    ``` shell
+    ./gopodder --dedup-guid       # plan merging copies of retitled episodes (same guid, different hash)
+    ./gopodder --dedup-guid-delete    # apply it
+
+    ./gopodder --dedup-twins      # same, for copies under the same filename prefix (rotated URL hashes)
+    ./gopodder --dedup-retitles   # same, for duplicates split across a podcast *rename*
+    ./gopodder --prune-stale-episodes # drop stale episode rows that would re-queue deleted variants
+    ```
+
+    Each pass prints its plan (`delete`/`rename`/`MANUAL`) and only touches files when a surviving copy of the same episode is kept; anything the evidence doesn't decide is reported `MANUAL` and left alone. The `-delete` variants also maintain `downloads`, `archived_episodes`, and stale `episodes` rows in the same transaction.
+
 ### To install dependencies
 
 - MacOS: `brew install eye-d3 wget`
@@ -156,13 +181,15 @@ The interactive picker also marks episodes as already-downloaded if they are in 
 
 Database Design (SQLite)
 
-Five tables: `podcasts`, `episodes`, `interactive_episodes`, `downloads`, and `archived_episodes`.
+Six tables: `podcasts`, `episodes`, `interactive_episodes`, `downloads`, `archived_episodes`, and `skipped_episodes`.
 
 - `podcasts` uses `title` as the primary key, meaning title changes would create a new record rather than updating
 - `episodes` and `interactive_episodes` are keyed on an MD5 hash of `podcast_title` + `episode_title`
     - The `interactive_episodes` table duplicates the `episodes` schema — this redundancy exists to separate batch vs. TUI concerns
+    - A feed retitling an episode therefore creates a new row; the `guid` column is the identity that survives retitles (see "Retitled episodes and deduplication" above)
 - `downloads` tracks filenames and tagging status (`tagged_at`)
 - `archived_episodes` records episode hashes that have been off-loaded to another volume; rows here suppress re-download (see "Archiving older podcasts" above)
+- `skipped_episodes` is the audit trail of downloads refused as retitle duplicates: the skipped episode, the matched sibling, the reason, and first/last skip timestamps
 - No foreign key constraints exist between tables
 
 ### Dependencies
@@ -183,6 +210,12 @@ The codebase is a flat, single-package Go project with clear file-level separati
 ├────────────────┼─────────────────────────────────────────────────┤
 │ archive.go     │ Archive registry (register/unregister/reconcile)│
 ├────────────────┼─────────────────────────────────────────────────┤
+│ dedup.go       │ Cleanup passes: twin/retitle/guid duplicate     │
+│                │ merging and stale-row pruning                   │
+├────────────────┼─────────────────────────────────────────────────┤
+│ skip.go        │ Download-time retitle detection (guid + title   │
+│                │ heuristics)                                     │
+├────────────────┼─────────────────────────────────────────────────┤
 │ interactive.go │ Bubble Tea TUI (multi-step episode picker)      │
 ├────────────────┼─────────────────────────────────────────────────┤
 │ httprss.go     │ RSS feed fetching/parsing via gofeed            │
@@ -191,7 +224,7 @@ The codebase is a flat, single-package Go project with clear file-level separati
 └────────────────┴─────────────────────────────────────────────────┘
 ```
 
-The batch workflow runs as a 5-stage pipeline: parse feeds → generate download list → download → update DB → tag MP3s. 
+The batch workflow runs as a 5-stage pipeline: parse feeds → generate download list → download → update DB → tag MP3s. The generate stage applies two skip checks before queueing anything: the prefix twin backstop (same canonical filename under another hash) and the retitle guard from `skip.go` (see "Retitled episodes and deduplication").
 
 The interactive mode is a separate state-machine driven by Bubble Tea with 7 steps (URL entry → feed select → loading → episode
 select → folder → downloading → done).

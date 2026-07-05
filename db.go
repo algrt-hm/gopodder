@@ -160,6 +160,23 @@ func createTablesIfNotExist() {
 	ON archived_episodes (archived_path);
 	`
 
+	// Audit trail of episodes the download pass refused as retitle duplicates
+	// (see skip.go); one row per skipped episode, refreshed on every run that
+	// skips it again.
+	createSkippedEpisodes := `
+	CREATE TABLE IF NOT EXISTS skipped_episodes (
+		podcastname_episodename_hash TEXT PRIMARY KEY,
+		podcast_title TEXT,
+		title TEXT,
+		guid TEXT,
+		matched_episode_hash TEXT,
+		matched_title TEXT,
+		reason TEXT,
+		first_skipped TEXT NOT NULL,
+		last_skipped TEXT NOT NULL
+	);
+	`
+
 	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
 
@@ -212,6 +229,11 @@ func createTablesIfNotExist() {
 		checkErr(err)
 
 		statement, err = db.Prepare(createArchivedEpisodesPathIdx)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
+		statement, err = db.Prepare(createSkippedEpisodes)
 		checkErr(err)
 		_, err = statement.Exec()
 		checkErr(err)
@@ -724,4 +746,60 @@ func updateDatabaseForDownloads() {
 	}
 
 	// Could check to see if anything has unexpectedly disappeared but this seems pointless hence not done
+}
+
+// skippedEpisodeRecord is one download-pass retitle skip destined for the
+// skipped_episodes audit table.
+type skippedEpisodeRecord struct {
+	episodeHash  string
+	podcastTitle string
+	title        string
+	guid         string
+	matchedHash  string
+	matchedTitle string
+	reason       string
+}
+
+// recordSkippedEpisodes upserts the run's retitle skips into skipped_episodes
+// in one transaction: new skips get first_skipped, repeat skips refresh
+// last_skipped and the match details.
+func recordSkippedEpisodes(records []skippedEpisodeRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO skipped_episodes
+			(podcastname_episodename_hash, podcast_title, title, guid,
+			 matched_episode_hash, matched_title, reason, first_skipped, last_skipped)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(podcastname_episodename_hash) DO UPDATE SET
+			matched_episode_hash = excluded.matched_episode_hash,
+			matched_title = excluded.matched_title,
+			reason = excluded.reason,
+			last_skipped = excluded.last_skipped
+		;`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, r := range records {
+		if _, err := stmt.Exec(r.episodeHash, r.podcastTitle, r.title, r.guid,
+			r.matchedHash, r.matchedTitle, r.reason, ts, ts); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
