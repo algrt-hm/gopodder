@@ -14,9 +14,16 @@ package main
 // primary rule is: if another episodes row with the same (podcast, guid)
 // already has a file, this row is a retitle of it — skip.
 //
+// The guid also survives a rename of the whole podcast (2026-07-09: BBC
+// retitled "Arts & Ideas" to "Free Thinking", re-hashing 1,486 episodes), so
+// a downloaded same-guid episode of a DIFFERENT podcast also marks a row as
+// a duplicate — but only with a corroborating title, since junk guids ("1",
+// a date) can collide between unrelated feeds.
+//
 // The fallback, for feeds that rotate GUIDs, is the title heuristic: same
 // podcast, same published date, digit sequences equal, and a material common
-// substring between the titles. The digit-sequence guard keeps "Part 1" /
+// substring between the titles; plus, for repeats whose guid and date both
+// changed, an exact-title match against a downloaded sibling, any date. The digit-sequence guard keeps "Part 1" /
 // "Part 2" siblings distinct, and the overlap threshold is relative to title
 // length because a short shared word ("markets", "tariffs") is normal between
 // two genuinely different same-day episodes of a daily feed.
@@ -206,9 +213,24 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 	dateKey := func(c downloadCandidate) string {
 		return c.podcastTitle + "\x00" + publishedDate10(c.published)
 	}
+	// Cross-podcast index of already-downloaded rows by guid alone, for
+	// whole-podcast renames (2026-07-09: BBC retitled "Arts & Ideas" to
+	// "Free Thinking" and 1,486 episodes re-hashed as new under the new
+	// podcast title, invisible to every same-podcast rule).
+	haveByGuid := make(map[string][]downloadCandidate)
+	// Same-podcast index by exact raw title, any date, for repeats whose
+	// guid AND published date both changed (see rule 3b).
+	haveByPodTitle := make(map[string][]downloadCandidate)
+	titleKey := func(c downloadCandidate) string {
+		return c.podcastTitle + "\x00" + c.title
+	}
 	for _, c := range cands {
 		if c.have {
 			haveByPodDate[dateKey(c)] = append(haveByPodDate[dateKey(c)], c)
+			haveByPodTitle[titleKey(c)] = append(haveByPodTitle[titleKey(c)], c)
+			if c.guid != "" {
+				haveByGuid[c.guid] = append(haveByGuid[c.guid], c)
+			}
 		}
 	}
 
@@ -240,6 +262,34 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 					matchedHash:  haveSib.episodeHash,
 					matchedTitle: haveSib.title,
 					reason:       "retitle: same guid as downloaded episode " + haveSib.episodeHash,
+				}
+				continue
+			}
+			// Rule 1b: an already-downloaded episode of ANOTHER podcast has
+			// this guid — the podcast itself was renamed, so the copy on disk
+			// lives under the old show name. Guid alone is not trustworthy
+			// across podcasts (feeds that use junk guids like "1" or a date
+			// can collide between unrelated shows), so the episode title must
+			// corroborate.
+			var renameSib *downloadCandidate
+			for i := range haveByGuid[c.guid] {
+				sib := haveByGuid[c.guid][i]
+				if sib.podcastTitle == c.podcastTitle || sib.episodeHash == c.episodeHash {
+					continue
+				}
+				if !materialTitleOverlap(c.title, sib.title) {
+					continue
+				}
+				if renameSib == nil || newerCandidate(sib, *renameSib) {
+					renameSib = &haveByGuid[c.guid][i]
+				}
+			}
+			if renameSib != nil {
+				skips[c.episodeHash] = downloadSkip{
+					matchedHash:  renameSib.episodeHash,
+					matchedTitle: renameSib.title,
+					reason: "rename: same guid and title as downloaded episode " +
+						renameSib.episodeHash + " of podcast " + renameSib.podcastTitle,
 				}
 				continue
 			}
@@ -278,6 +328,32 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 				matchedHash:  matches[0].episodeHash,
 				matchedTitle: matches[0].title,
 				reason:       "retitle: same date and overlapping title as downloaded episode " + matches[0].episodeHash,
+			}
+			continue
+		}
+
+		// Rule 3b: an already-downloaded same-podcast episode with the
+		// IDENTICAL raw title, any date — a repeat re-entering the feed with
+		// a fresh guid and its re-broadcast date. This was invisible before
+		// podcast renames existed: the episode hash is md5(podcast + title),
+		// so a same-titled item collapsed into the existing row at ingestion
+		// and never became a download candidate. Exact equality (not
+		// materialTitleOverlap) keeps this as tight as the old hash identity.
+		var repeatSib *downloadCandidate
+		for i := range haveByPodTitle[titleKey(c)] {
+			sib := haveByPodTitle[titleKey(c)][i]
+			if sib.episodeHash == c.episodeHash {
+				continue
+			}
+			if repeatSib == nil || newerCandidate(sib, *repeatSib) {
+				repeatSib = &haveByPodTitle[titleKey(c)][i]
+			}
+		}
+		if repeatSib != nil {
+			skips[c.episodeHash] = downloadSkip{
+				matchedHash:  repeatSib.episodeHash,
+				matchedTitle: repeatSib.title,
+				reason:       "repeat: identical title as downloaded episode " + repeatSib.episodeHash,
 			}
 		}
 	}

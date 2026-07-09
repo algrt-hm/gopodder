@@ -1,5 +1,77 @@
 # Bugs found
 
+## Whole podcast re-downloaded after publisher rename (2026-07-09)
+
+The BBC renamed the show in feed `podcasts.files.bbci.co.uk/p02nrvk3.rss`
+from "Arts & Ideas" to "Free Thinking" (programme link changed to
+`b0144txn`). Podcasts are keyed by title and the episode hash is
+MD5(podcast title + episode title), so the 09:55 run saw a brand-new
+podcast, inserted 1,486 episode rows under new hashes, and queued the entire
+back catalogue for download:
+
+```
+./gopodder 2026/07/09 09:55:20 db.go:321: Free Thinking is not in the db and seems to be a new podcast, adding
+1510 podcasts are in the feeds which have not been downloaded after fn title scan
+```
+
+31 duplicate files (~1.6 GB) landed before cron.sh was killed. The 2026-07-05
+guid guard in skip.go never fired because it groups by (podcast, guid), and
+the podcast title is exactly what changed; the either-hash twin check never
+fired because BBC download URLs are signed/rotating (only 74/1,486 rows
+matched by `file_url_hash`). The item guids themselves were stable across the
+rename — 1,194/1,486 identical.
+
+Fixes:
+
+- `db.go`: rename detection at parse time — a feed title not in the db is
+  only a new podcast if its episode guids don't overwhelmingly (≥3 and ≥half)
+  belong to one existing podcast; otherwise the podcast is renamed in place
+  (`podcasts.title`, `episodes.podcast_title`), episode hashes deliberately
+  untouched since the hash is what ties a row to its file on disk.
+- `db.go`: on an episode-hash miss, a corroborated same-(podcast, guid)
+  sibling (same published date or materially overlapping title) is refreshed
+  in place instead of inserting a twin row.
+- `skip.go`: download-time backstop — a downloaded same-guid episode of
+  ANOTHER podcast with a corroborating title marks the row as a rename
+  duplicate.
+
+Verified by replaying the pre-run state (incident db + the real feed):
+rename detected (1205/1525 guids), 1,194 episodes refreshed in place, 312
+inserted (stale-guid repeats + genuinely new), 266 of those covered by the
+same-date/title rule at download time. Residual worst case ~46 episodes vs
+1,486.
+
+Cleanup: `cleanup_free_thinking_rename.sh` (run on the gopodder host after
+deploying the fix) purges the mistaken "Free Thinking" rows so the next
+parse applies the rename, and deletes the 31 duplicate files.
+
+### Residual: repeats re-downloaded after the rename fix (same day)
+
+The 10:59 run applied the rename correctly but still queued 45 episodes: 26
+were BBC repeats — same episode title, but a NEW guid and the re-broadcast
+date, so neither the guid fallback (guid changed) nor the same-date skip
+rule (date changed) caught them; 19 were 2011-era episodes genuinely new to
+the collection. 10 duplicate files landed before cron.sh was killed again.
+
+Pre-rename this case could not exist: the episode hash is md5(podcast +
+title), so a same-(podcast, title) feed item always collapsed into the
+existing row at ingestion. The rename split that identity for every
+pre-rename row, so BBC repeats would have kept trickling in as "new"
+downloads indefinitely. Fixes, both provably no more aggressive than the
+pre-rename hash identity:
+
+- `db.go`: ingestion fallback extended — hash miss, no guid sibling, but a
+  same-(podcast, exact title) sibling exists → refresh that row in place.
+- `skip.go` rule 3b: an already-downloaded same-podcast episode with the
+  identical raw title skips, any date.
+
+Verified by replaying the post-rename live db + real feed: after dropping
+the 292 exact-title twin rows, re-ingesting the feed mints zero rows (1,505
+matched by guid or title). Cleanup: `cleanup_free_thinking_residual.sh`
+drops the twin rows, deletes the 10 duplicate files, and keeps the genuinely
+new ones. Expect ~17 legitimate Free Thinking downloads on the next run
+(back-catalogue episodes never held).
+
 ## Retitled episodes re-downloaded (2026-07-05)
 
 The 18:05 run downloaded four "new" Knowledge Project episodes dated March–April 2026:

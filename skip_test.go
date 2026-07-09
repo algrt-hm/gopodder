@@ -83,10 +83,10 @@ func TestPlanDownloadSkipsGuidSiblingAlreadyDownloaded(t *testing.T) {
 	// The 2026-07-05 incident: retitled row pending, older title on disk
 	cands := []downloadCandidate{
 		{podcastTitle: "The Knowledge Project", published: "2026-03-03T09:00:00Z",
-			title: "Inside the Mind of Robinhood Co-Founder Vlad Tenev",
+			title:       "Inside the Mind of Robinhood Co-Founder Vlad Tenev",
 			episodeHash: "aaa", guid: "guid-tenev", lastSeen: "2026-04-21T00:00:00Z", have: true},
 		{podcastTitle: "The Knowledge Project", published: "2026-03-03T09:00:00Z",
-			title: "The Near Death Experience of RobinHood | Vlad Tenev, Co-Founder",
+			title:       "The Near Death Experience of RobinHood | Vlad Tenev, Co-Founder",
 			episodeHash: "bbb", guid: "guid-tenev", lastSeen: "2026-07-05T00:00:00Z", have: false},
 	}
 	skips := planDownloadSkips(cands)
@@ -121,7 +121,9 @@ func TestPlanDownloadSkipsGuidPendingPair(t *testing.T) {
 }
 
 func TestPlanDownloadSkipsGuidAcrossPodcastsIndependent(t *testing.T) {
-	// Same guid string under two different podcasts must not interact
+	// Same guid string under two different podcasts must not interact when
+	// the titles don't corroborate (junk guids like "1" or a date can
+	// collide between unrelated feeds)
 	cands := []downloadCandidate{
 		{podcastTitle: "A", published: "2026-06-01T00:00:00Z", title: "T",
 			episodeHash: "a1", guid: "shared", have: true},
@@ -130,6 +132,68 @@ func TestPlanDownloadSkipsGuidAcrossPodcastsIndependent(t *testing.T) {
 	}
 	if skips := planDownloadSkips(cands); len(skips) != 0 {
 		t.Errorf("expected no skips across podcasts, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsCrossPodcastRename(t *testing.T) {
+	// The 2026-07-09 incident: BBC retitled "Arts & Ideas" to "Free
+	// Thinking"; every episode re-hashed as new under the new podcast title
+	// while its copy sat on disk under the old one. Same guid plus the same
+	// title across podcasts must skip.
+	cands := []downloadCandidate{
+		{podcastTitle: "Arts & Ideas", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "old1", guid: "urn:bbc:podcast:p0nwsdfz", have: true},
+		{podcastTitle: "Free Thinking", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "new1", guid: "urn:bbc:podcast:p0nwsdfz", have: false},
+	}
+	skips := planDownloadSkips(cands)
+	s, ok := skips["new1"]
+	if !ok {
+		t.Fatal("expected renamed-podcast row to be skipped")
+	}
+	if s.matchedHash != "old1" {
+		t.Errorf("matchedHash = %q, want old1", s.matchedHash)
+	}
+	if _, ok := skips["old1"]; ok {
+		t.Error("already-downloaded row must not be skipped")
+	}
+}
+
+func TestPlanDownloadSkipsCrossPodcastGuidNoFileNoSkip(t *testing.T) {
+	// A same-guid same-title row of another podcast that has NO file gives
+	// us nothing to point at — the pending row must still download
+	cands := []downloadCandidate{
+		{podcastTitle: "Arts & Ideas", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "old1", guid: "urn:bbc:podcast:p0nwsdfz", have: false},
+		{podcastTitle: "Free Thinking", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "new1", guid: "urn:bbc:podcast:p0nwsdfz", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no skips when neither copy has a file, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsSamePodcastGuidRuleWinsOverRename(t *testing.T) {
+	// When both a same-podcast and a cross-podcast guid sibling have files,
+	// the same-podcast one is the better record to point at
+	cands := []downloadCandidate{
+		{podcastTitle: "Free Thinking", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "sameA", guid: "g", have: true},
+		{podcastTitle: "Arts & Ideas", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic",
+			episodeHash: "crossB", guid: "g", have: true},
+		{podcastTitle: "Free Thinking", published: "2026-07-03T15:00:00Z",
+			title:       "Trade and traffic (extended)",
+			episodeHash: "pend", guid: "g", have: false},
+	}
+	skips := planDownloadSkips(cands)
+	if s, ok := skips["pend"]; !ok || s.matchedHash != "sameA" {
+		t.Errorf("expected same-podcast guid sibling to win, got %+v", skips)
 	}
 }
 
@@ -176,5 +240,56 @@ func TestPlanDownloadSkipsPartSiblings(t *testing.T) {
 	}
 	if skips := planDownloadSkips(cands); len(skips) != 0 {
 		t.Errorf("expected no skips for part siblings, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsRepeatIdenticalTitleAnyDate(t *testing.T) {
+	// BBC repeat: same episode re-enters the feed with a fresh guid and the
+	// re-broadcast date. Identical title + a downloaded sibling must skip
+	// regardless of date (rule 3b) — this was the 45-episode residual tail
+	// of the 2026-07-09 rename incident.
+	cands := []downloadCandidate{
+		{podcastTitle: "Free Thinking", published: "2023-06-15T16:00:00Z",
+			title:       "Hitchhiking",
+			episodeHash: "orig", guid: "urn:bbc:podcast:p0bpr86s", have: true},
+		{podcastTitle: "Free Thinking", published: "2024-02-28T17:00:00Z",
+			title:       "Hitchhiking",
+			episodeHash: "repeat", guid: "urn:bbc:podcast:p0hffcg6", have: false},
+	}
+	skips := planDownloadSkips(cands)
+	if s, ok := skips["repeat"]; !ok || s.matchedHash != "orig" {
+		t.Errorf("expected repeat to skip against original, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsSimilarTitleDifferentDateNotSkipped(t *testing.T) {
+	// Rule 3b requires EXACT title equality; a merely similar title on a
+	// different date is not enough evidence (rule 3 handles same-date)
+	cands := []downloadCandidate{
+		{podcastTitle: "P", published: "2023-06-15T16:00:00Z",
+			title:       "Interview with Jane Smith",
+			episodeHash: "h1", guid: "g1", have: true},
+		{podcastTitle: "P", published: "2024-02-28T17:00:00Z",
+			title:       "An Interview with Jane Smith",
+			episodeHash: "h2", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no skips for similar title on different date, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsIdenticalTitleOtherPodcastNotSkippedByRepeatRule(t *testing.T) {
+	// Rule 3b is same-podcast only: an identically-titled episode of a
+	// different podcast (no guid link) must not suppress the download
+	cands := []downloadCandidate{
+		{podcastTitle: "Show A", published: "2023-06-15T16:00:00Z",
+			title:       "Christmas Special",
+			episodeHash: "h1", guid: "g1", have: true},
+		{podcastTitle: "Show B", published: "2024-12-24T17:00:00Z",
+			title:       "Christmas Special",
+			episodeHash: "h2", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no cross-podcast repeat skips, got %+v", skips)
 	}
 }

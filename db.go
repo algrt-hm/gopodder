@@ -137,6 +137,13 @@ func createTablesIfNotExist() {
 	ON interactive_episodes (file_url_hash);
 	`
 
+	// Serves the guid-sibling lookup in podEpisodesIntoDatabase (retitle/
+	// rename fallback on an episode-hash miss).
+	createEpisodesPodcastGuidIdx := `
+	CREATE INDEX IF NOT EXISTS idx_episodes_podcast_guid
+	ON episodes (podcast_title, guid);
+	`
+
 	createDownloaded := `
 	CREATE TABLE IF NOT EXISTS downloads (
 		filename TEXT PRIMARY KEY,
@@ -218,6 +225,11 @@ func createTablesIfNotExist() {
 		_, err = statement.Exec()
 		checkErr(err)
 
+		statement, err = db.Prepare(createEpisodesPodcastGuidIdx)
+		checkErr(err)
+		_, err = statement.Exec()
+		checkErr(err)
+
 		statement, err = db.Prepare(createDownloaded)
 		checkErr(err)
 		_, err = statement.Exec()
@@ -244,6 +256,159 @@ func createTablesIfNotExist() {
 		_, err = db.Exec(`DELETE FROM interactive_episodes WHERE podcast_title IS NULL OR TRIM(podcast_title) = '';`)
 		checkErr(err)
 	}
+}
+
+// A feed title we have never seen is only treated as a NEW podcast after a
+// rename check: if at least this many of the feed's episode guids — and at
+// least half of them — already belong to one existing podcast, the feed is
+// that podcast under a new name (2026-07-09: BBC retitled "Arts & Ideas" to
+// "Free Thinking" and 1,486 episodes were queued for re-download).
+const renameMinGuidMatches = 3
+
+// detectPodcastRename reports which existing podcast (if any) the incoming
+// feed is a rename of, by counting how many of the feed's episode guids sit
+// on that podcast's episode rows. Returns "" when no podcast qualifies. Only
+// titles that still have a podcasts row count: orphaned episode rows can't be
+// renamed in place coherently, and the cross-podcast guard in skip.go still
+// protects their files from re-download.
+func detectPodcastRename(tx *sql.Tx, newTitle string, episodes []M) (oldTitle string, matched int, total int) {
+	guidSet := make(map[string]bool)
+	for idx := range episodes {
+		if g, ok := episodes[idx][guid].(string); ok {
+			if g = strings.TrimSpace(g); g != "" {
+				guidSet[g] = true
+			}
+		}
+	}
+	total = len(guidSet)
+	if total < renameMinGuidMatches {
+		return "", 0, total
+	}
+
+	guids := make([]string, 0, total)
+	for g := range guidSet {
+		guids = append(guids, g)
+	}
+
+	// Chunked IN(...) to stay clear of SQLite's bound-parameter limit.
+	counts := make(map[string]int)
+	const chunkSize = 500
+	for start := 0; start < len(guids); start += chunkSize {
+		chunk := guids[start:min(start+chunkSize, len(guids))]
+		args := make([]interface{}, len(chunk))
+		for i, g := range chunk {
+			args[i] = g
+		}
+		rows, err := tx.Query(`
+			SELECT podcast_title, COUNT(DISTINCT guid)
+			FROM episodes
+			WHERE podcast_title IS NOT NULL
+			AND guid IN (?`+strings.Repeat(",?", len(chunk)-1)+`)
+			GROUP BY podcast_title
+			;`, args...)
+		checkErr(err)
+		for rows.Next() {
+			var t string
+			var n int
+			checkErr(rows.Scan(&t, &n))
+			counts[t] += n
+		}
+		checkErr(rows.Err())
+	}
+
+	best, bestCount := "", 0
+	for t, n := range counts {
+		if t != newTitle && (n > bestCount || (n == bestCount && t < best)) {
+			best, bestCount = t, n
+		}
+	}
+	if bestCount < renameMinGuidMatches || bestCount*2 < total {
+		return "", 0, total
+	}
+
+	var inPodcasts int
+	checkErr(tx.QueryRow(`SELECT count(*) FROM podcasts WHERE title = ?;`, best).Scan(&inPodcasts))
+	if inPodcasts == 0 {
+		return "", 0, total
+	}
+	return best, bestCount, total
+}
+
+// renamePodcastInPlace rewrites oldTitle to the feed's current title on the
+// podcasts row and on every episode row's podcast_title. The episode hashes
+// (podcastname_episodename_hash) are deliberately NOT recomputed: the hash is
+// the stable identity that ties a row to its file on disk and to the archive
+// registry, and the files keep their old-name filenames.
+func renamePodcastInPlace(tx *sql.Tx, oldTitle string, pod map[string]string) {
+	_, err := tx.Exec(`
+		UPDATE podcasts
+		SET title = ?, author = ?, category = ?, description = ?,
+			language = ?, link = ?, last_seen = ?
+		WHERE title = ?
+		;`,
+		nullWrap(pod[title]),
+		nullWrap(pod[author]),
+		nullWrap(pod[category]),
+		nullWrap(pod[description]),
+		nullWrap(pod[language_]),
+		nullWrap(pod[link]),
+		ts,
+		oldTitle,
+	)
+	checkErr(err)
+	_, err = tx.Exec(`UPDATE episodes SET podcast_title = ? WHERE podcast_title = ?;`, pod[title], oldTitle)
+	checkErr(err)
+	_, err = tx.Exec(`UPDATE interactive_episodes SET podcast_title = ? WHERE podcast_title = ?;`, pod[title], oldTitle)
+	checkErr(err)
+}
+
+// findTitleSibling returns the episode hash of an existing same-podcast row
+// with the IDENTICAL episode title, or "". This restores the pre-rename
+// identity semantics: the episode hash is md5(podcast title + episode
+// title), so a same-(podcast, title) feed item always collapsed into the
+// existing row — repeats re-entering the feed with a fresh guid and their
+// re-broadcast date (BBC does this constantly) were refreshed, never
+// re-inserted. After a podcast rename the old rows keep their old-name
+// hashes, so without this fallback every such repeat mints a fileless twin
+// row that gets re-downloaded (the 2026-07-09 residual: 26 of 45 queued).
+func findTitleSibling(stmt *sql.Stmt, podTitle string, ep map[string]string) string {
+	if strings.TrimSpace(ep[title]) == "" {
+		return ""
+	}
+	var hash string
+	err := stmt.QueryRow(podTitle, ep[title]).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	checkErr(err)
+	return hash
+}
+
+// findGuidSibling returns the episode hash of an existing same-podcast row
+// that the incoming episode is a retitle of: same guid, corroborated by the
+// same published date or a materially overlapping title. "" when there is no
+// such row. The corroboration hedges against feeds that reuse junk guids —
+// stricter than the download-time rule 1 in skip.go, which trusts a
+// same-(podcast, guid) match outright.
+func findGuidSibling(stmt *sql.Stmt, podTitle string, ep map[string]string) string {
+	if strings.TrimSpace(ep[guid]) == "" {
+		return ""
+	}
+	rows, err := stmt.Query(podTitle, ep[guid])
+	checkErr(err)
+	defer rows.Close()
+
+	epDate := publishedDate10(ep[published])
+	for rows.Next() {
+		var hash, rowTitle, rowPublished string
+		checkErr(rows.Scan(&hash, &rowTitle, &rowPublished))
+		if (epDate != "" && epDate == publishedDate10(rowPublished)) ||
+			materialTitleOverlap(ep[title], rowTitle) {
+			return hash
+		}
+	}
+	checkErr(rows.Err())
+	return ""
 }
 
 // podEpisodesIntoDatabase adds the podcast metadata to the db.
@@ -313,11 +478,22 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 		}
 	}
 
-	// If no then add it to the db
+	// If no then add it to the db — unless the feed's episode guids say this
+	// is an existing podcast under a new name, in which case rename in place
+	// (episode hashes, and hence the tie to files on disk, stay stable).
 	if count == 0 {
 		// Check the title isn't nonsense
 		checkStr(pod[title], title)
 
+		if oldTitle, matched, total := detectPodcastRename(tx, pod[title], episodes); oldTitle != "" {
+			log.Printf("%q is not in the db but %d/%d feed guids belong to %q — treating as a podcast rename, updating in place",
+				pod[title], matched, total, oldTitle)
+			renamePodcastInPlace(tx, oldTitle, pod)
+			count = 1
+		}
+	}
+
+	if count == 0 {
 		log.Println(pod[title], "is not in the db and seems to be a new podcast, adding")
 
 		// We wrap these because we don't want empty strings in the db ideally
@@ -373,6 +549,32 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 	checkErr(err)
 	defer epUpdateStmt.Close()
 
+	// Same-podcast rows sharing an incoming episode's guid, for the retitle/
+	// rename fallback when the episode hash misses. Ordered for determinism
+	// when a guid-abusing feed yields several candidates.
+	epGuidLookupStmt, err := tx.Prepare(`
+		SELECT podcastname_episodename_hash, IFNULL(title, ''),
+			IFNULL(published, IFNULL(first_seen, ''))
+		FROM episodes
+		WHERE podcast_title = ? AND guid = ?
+		ORDER BY podcastname_episodename_hash
+		;`)
+	checkErr(err)
+	defer epGuidLookupStmt.Close()
+
+	// Same-podcast row with the identical episode title, for the repeat
+	// fallback when both the hash and the guid miss (see findTitleSibling).
+	// ORDER BY for determinism when historical twins share a title.
+	epTitleLookupStmt, err := tx.Prepare(`
+		SELECT podcastname_episodename_hash
+		FROM episodes
+		WHERE podcast_title = ? AND title = ?
+		ORDER BY podcastname_episodename_hash
+		LIMIT 1
+		;`)
+	checkErr(err)
+	defer epTitleLookupStmt.Close()
+
 	epInsertStmt, err := tx.Prepare(`
 		INSERT INTO episodes (
 			author, description, episode,
@@ -393,6 +595,8 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 	interStmt, err := tx.Prepare(interactiveEpisodeUpsertSQL)
 	checkErr(err)
 	defer interStmt.Close()
+
+	guidRefreshed := 0
 
 	for idx := range episodes {
 		// Do some type conversion map[string]interface{} to map[string]string
@@ -433,6 +637,29 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 
 		if count > 1 {
 			log.Panicln(ep[title], "is in the db more than once, this should not happen")
+		}
+
+		// A hash miss can still be a known episode: the hash embeds the
+		// podcast and episode titles, so a retitle — or a whole-podcast
+		// rename, just applied above — mints a fresh hash for an episode
+		// whose row (and file on disk) we already have. A corroborated
+		// same-(podcast, guid) sibling, or failing that a same-(podcast,
+		// title) sibling (a repeat re-entering the feed under a fresh guid),
+		// keeps that row's identity instead of inserting a twin that would
+		// be re-downloaded.
+		if count == 0 {
+			sibling := findGuidSibling(epGuidLookupStmt, pod[title], ep)
+			if sibling == "" {
+				sibling = findTitleSibling(epTitleLookupStmt, pod[title], ep)
+			}
+			if sibling != "" {
+				if verbose {
+					log.Printf("episode %q matches existing row %s by guid/title, refreshing in place", ep[title], sibling)
+				}
+				podcastNameEpisodenameHash = sibling
+				guidRefreshed++
+				count = 1
+			}
 		}
 
 		if count == 1 {
@@ -488,6 +715,10 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 
 		err = execInteractiveUpsert(interStmt, pod[title], ep, podcastNameEpisodenameHash, fileUrlHash)
 		checkErr(err)
+	}
+
+	if guidRefreshed > 0 {
+		log.Printf("%d episode(s) of %q matched existing rows by guid or title (retitle/rename/repeat) and were refreshed in place", guidRefreshed, pod[title])
 	}
 
 	checkErr(tx.Commit())
