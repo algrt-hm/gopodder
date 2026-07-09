@@ -183,10 +183,11 @@ Database Design (SQLite)
 
 Six tables: `podcasts`, `episodes`, `interactive_episodes`, `downloads`, `archived_episodes`, and `skipped_episodes`.
 
-- `podcasts` uses `title` as the primary key, meaning title changes would create a new record rather than updating
+- `podcasts` uses `title` as the primary key. A feed renaming the whole show is detected at parse time (a majority of the feed's episode guids already belonging to one existing podcast) and applied as an in-place rename of the `podcasts` row and `episodes.podcast_title` — not a new record
 - `episodes` and `interactive_episodes` are keyed on an MD5 hash of `podcast_title` + `episode_title`
     - The `interactive_episodes` table duplicates the `episodes` schema — this redundancy exists to separate batch vs. TUI concerns
-    - A feed retitling an episode therefore creates a new row; the `guid` column is the identity that survives retitles (see "Retitled episodes and deduplication" above)
+    - A feed retitling an episode is matched back to its existing row at parse time by `guid` (corroborated by published date or title overlap) or by exact title; only an uncorroborated retitle creates a new row, which the download-time guard then refuses (see "Retitled episodes and deduplication" above)
+    - **The hash is a stable identity, not a derivation.** It is what ties a row to its file on disk and to the archive registry, so it is never recomputed. After a podcast rename the back catalogue keeps hashes computed from the *old* podcast title, and the files keep their old-name filenames — e.g. since the 2026-07-09 "Arts & Ideas" → "Free Thinking" rename, that show's pre-rename rows carry `md5('Arts & Ideas' + episode_title)` and live on disk as `Arts_Ideas-*.mp3`. Ad-hoc queries, scripts, or new code must never assume `podcastname_episodename_hash == md5(podcast_title + title)` for existing rows; treat the stored hash as opaque
 - `downloads` tracks filenames and tagging status (`tagged_at`)
 - `archived_episodes` records episode hashes that have been off-loaded to another volume; rows here suppress re-download (see "Archiving older podcasts" above)
 - `skipped_episodes` is the audit trail of downloads refused as retitle duplicates: the skipped episode, the matched sibling, the reason, and first/last skip timestamps
