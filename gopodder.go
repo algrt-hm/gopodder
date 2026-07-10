@@ -794,6 +794,7 @@ func parseThem(conf_file_path string) {
 	checkErr(err)
 
 	type feedResult struct {
+		url      string
 		podcast  map[string]string
 		episodes []M
 		err      error
@@ -815,7 +816,7 @@ func parseThem(conf_file_path string) {
 			defer wg.Done()
 			for url := range jobs {
 				podcast, episodes, parseErr := parseFeed(url)
-				results <- feedResult{podcast, episodes, parseErr}
+				results <- feedResult{url, podcast, episodes, parseErr}
 			}
 		}()
 	}
@@ -848,7 +849,7 @@ func parseThem(conf_file_path string) {
 		// any error whose text didn't contain "http error", so one flaky feed
 		// killed the entire run.) Log it and move on; the next run retries it.
 		if r.err != nil {
-			log.Printf("Skipping feed: %s", r.err)
+			log.Printf("Skipping feed %s: %s", r.url, r.err)
 			continue
 		}
 		podEpisodesIntoDatabase(db, r.podcast, r.episodes)
