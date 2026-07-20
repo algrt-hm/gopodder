@@ -71,6 +71,37 @@ func TestMaterialTitleOverlap(t *testing.T) {
 			"The Rise and Fall of Enron",
 			false,
 		},
+		{
+			// 2026-07-20: World Service edition prefix — too short for
+			// containment (14 runes) and too few words for the word-set
+			// path; the prefix-strip path must recognise it
+			"ws edition prefix",
+			"Climate Change",
+			"WS MoreOrLess: Climate Change",
+			true,
+		},
+		{
+			// Spelled-out number vs digit ("Part One" / "Part 1")
+			"number word vs digit",
+			"Numbers of the Year Part One",
+			"WS More or Less: Numbers of the Year Part 1",
+			true,
+		},
+		{
+			// Spelled-out part siblings must hit the digit guard exactly
+			// like "Part 1" vs "Part 2" does
+			"number word part siblings",
+			"Numbers of the year: Part one",
+			"Numbers of the year: Part two",
+			false,
+		},
+		{
+			// A preview is not another edition of the full episode
+			"preview prefix not stripped",
+			"Preview: The Fall of Rome",
+			"The Fall of Rome",
+			false,
+		},
 	}
 	for _, c := range cases {
 		if got := materialTitleOverlap(c.a, c.b); got != c.want {
@@ -275,6 +306,107 @@ func TestPlanDownloadSkipsSimilarTitleDifferentDateNotSkipped(t *testing.T) {
 	}
 	if skips := planDownloadSkips(cands); len(skips) != 0 {
 		t.Errorf("expected no skips for similar title on different date, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDateReissue(t *testing.T) {
+	// The 2026-07-20 incident: BBC re-served the Radio 4 edition of a More
+	// or Less episode whose World Service edition, dated three days later,
+	// was already on disk. Fresh guid, shifted date, prefixed title — only
+	// the near-date rule (3a) can see it.
+	cands := []downloadCandidate{
+		{podcastTitle: "More or Less", published: "2015-12-08T00:00:00Z",
+			title:       "WS MoreOrLess: Climate Change",
+			episodeHash: "ws", guid: "urn:bbc:podcast:p03b1kn2", have: true},
+		{podcastTitle: "More or Less", published: "2015-12-05T00:00:00Z",
+			title:       "Climate Change",
+			episodeHash: "r4", guid: "urn:bbc:podcast:p03999ky", have: false},
+	}
+	skips := planDownloadSkips(cands)
+	if s, ok := skips["r4"]; !ok || s.matchedHash != "ws" {
+		t.Errorf("expected near-date re-issue to skip against WS edition, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDateCaseOnlyRetitle(t *testing.T) {
+	// Same batch: identical title up to casing, eight days apart — rule 3b
+	// needs the exact raw title, rule 3a must catch the case variant
+	cands := []downloadCandidate{
+		{podcastTitle: "More or Less", published: "2018-07-23T00:00:00Z",
+			title:       "Should we have smaller families to save the planet?",
+			episodeHash: "ws", guid: "g-ws", have: true},
+		{podcastTitle: "More or Less", published: "2018-07-15T00:00:00Z",
+			title:       "Should We Have Smaller Families To Save The Planet?",
+			episodeHash: "r4", guid: "g-r4", have: false},
+	}
+	skips := planDownloadSkips(cands)
+	if s, ok := skips["r4"]; !ok || s.matchedHash != "ws" {
+		t.Errorf("expected case-only retitle to skip across dates, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDateNeedsStrictEvidence(t *testing.T) {
+	// The word-set overlap that suffices on the SAME date is not enough
+	// evidence across dates: a weekly feed revisiting a topic days later
+	// must still download
+	cands := []downloadCandidate{
+		{podcastTitle: "P", published: "2026-05-01T00:00:00Z",
+			title:       "The Magic of Thinking Big | XPO CEO Mario Harik",
+			episodeHash: "h1", guid: "g1", have: true},
+		{podcastTitle: "P", published: "2026-05-04T00:00:00Z",
+			title:       "The Magic of Thinking Big: Mario Harik",
+			episodeHash: "h2", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no cross-date skip on word-set evidence alone, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDateWindowBounded(t *testing.T) {
+	// Outside the ±10-day window even a case-variant title is not matched
+	// (rule 3b still handles exact raw repeats at any distance)
+	cands := []downloadCandidate{
+		{podcastTitle: "P", published: "2018-07-01T00:00:00Z",
+			title:       "Should we have smaller families to save the planet?",
+			episodeHash: "h1", guid: "g1", have: true},
+		{podcastTitle: "P", published: "2018-07-15T00:00:00Z",
+			title:       "Should We Have Smaller Families To Save The Planet?",
+			episodeHash: "h2", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no skip outside the near-date window, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDatePartSiblings(t *testing.T) {
+	// Multi-part specials straddle days; the digit guard (including
+	// spelled-out numbers) must keep them apart
+	cands := []downloadCandidate{
+		{podcastTitle: "More or Less", published: "2014-12-20T00:00:00Z",
+			title:       "WS MoreOrLess: Numbers of the Year part 1.",
+			episodeHash: "p1", guid: "g1", have: true},
+		{podcastTitle: "More or Less", published: "2014-12-27T00:00:00Z",
+			title:       "WS MoreOrLess: Numbers of the Year part 2.",
+			episodeHash: "p2", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected no skip for near-date part siblings, got %+v", skips)
+	}
+}
+
+func TestPlanDownloadSkipsNearDatePreviewNotMatched(t *testing.T) {
+	// A downloaded preview must not suppress the full episode released a
+	// few days later
+	cands := []downloadCandidate{
+		{podcastTitle: "P", published: "2026-05-01T00:00:00Z",
+			title:       "Preview: How the Fed Broke Money",
+			episodeHash: "pre", guid: "g1", have: true},
+		{podcastTitle: "P", published: "2026-05-04T00:00:00Z",
+			title:       "How the Fed Broke Money",
+			episodeHash: "full", guid: "g2", have: false},
+	}
+	if skips := planDownloadSkips(cands); len(skips) != 0 {
+		t.Errorf("expected preview not to suppress the full episode, got %+v", skips)
 	}
 }
 

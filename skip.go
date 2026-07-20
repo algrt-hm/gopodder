@@ -23,19 +23,32 @@ package main
 // The fallback, for feeds that rotate GUIDs, is the title heuristic: same
 // podcast, same published date, digit sequences equal, and a material common
 // substring between the titles; plus, for repeats whose guid and date both
-// changed, an exact-title match against a downloaded sibling, any date. The digit-sequence guard keeps "Part 1" /
-// "Part 2" siblings distinct, and the overlap threshold is relative to title
-// length because a short shared word ("markets", "tariffs") is normal between
-// two genuinely different same-day episodes of a daily feed.
+// changed, an exact-title match against a downloaded sibling, any date. The
+// digit-sequence guard keeps "Part 1" / "Part 2" siblings distinct, and the
+// overlap threshold is relative to title length because a short shared word
+// ("markets", "tariffs") is normal between two genuinely different same-day
+// episodes of a daily feed.
+//
+// Cross-date re-issues need one more rule (2026-07-20: BBC re-served Radio 4
+// editions of nine More or Less episodes whose World Service editions —
+// "WS MoreOrLess: Climate Change" and the like, dated 1-8 days later — were
+// already on disk; the same-date rule couldn't see them and the exact-title
+// repeat rule didn't match the prefixed titles). Rule 3a matches a
+// same-podcast downloaded sibling published within a few days, but only on
+// STRICT title evidence — normalized equality, long containment, or equality
+// after stripping a short "Label: " prefix — never the word-set path, which
+// across dates would let a daily feed's recurring topic titles collide.
 //
 // planDownloadSkips is pure (no db, no filesystem) so the tricky cases are
 // unit-testable, mirroring planDedup. Skips are recorded in the
 // skipped_episodes table by the caller for auditing.
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -50,6 +63,10 @@ const (
 	// and shuffle everything else.
 	retitleJaccardMin   = 0.65
 	retitleMinWordsHits = 3
+	// Rule 3a window: a downloaded same-podcast sibling published within
+	// this many days with a strictly equivalent title is a re-issue. The
+	// largest offset observed in the 2026-07-20 batch was 8 days.
+	nearDateSkipWindowDays = 10
 )
 
 // Filtered out before word-set comparison: template glue that inflates
@@ -60,6 +77,15 @@ var retitleStopwords = map[string]bool{
 	"for": true, "from": true, "in": true, "is": true, "it": true, "of": true,
 	"on": true, "or": true, "s": true, "the": true, "to": true, "vs": true,
 	"with": true,
+}
+
+// Standalone spelled-out numbers normalize to digits so "Part One" equals
+// "Part 1" — and, just as important, so "Part One" vs "Part Two" is caught
+// by the digit-sequence guard instead of slipping past it digit-free.
+var numberWordDigits = map[string]string{
+	"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+	"six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+	"eleven": "11", "twelve": "12",
 }
 
 // downloadCandidate is one episodes row considered for download. have means a
@@ -87,9 +113,47 @@ type downloadSkip struct {
 var nonAlnumRe = regexp.MustCompile(`[^a-z0-9]+`)
 
 // normalizeTitleForOverlap lowercases and collapses punctuation/whitespace so
-// cosmetic retitle churn ("Ai Goes  Parabolic") doesn't break the overlap.
+// cosmetic retitle churn ("Ai Goes  Parabolic") doesn't break the overlap,
+// and maps spelled-out numbers to digits.
 func normalizeTitleForOverlap(s string) string {
-	return strings.TrimSpace(nonAlnumRe.ReplaceAllString(strings.ToLower(s), " "))
+	fields := strings.Fields(nonAlnumRe.ReplaceAllString(strings.ToLower(s), " "))
+	for i, w := range fields {
+		if d, ok := numberWordDigits[w]; ok {
+			fields[i] = d
+		}
+	}
+	return strings.Join(fields, " ")
+}
+
+// titlePrefixRe matches a short leading "Label: " — the shape broadcasters
+// use for edition prefixes ("WS MoreOrLess: Climate Change"). Bounded so a
+// colon in the middle of a long sentence-title doesn't count as a label.
+var titlePrefixRe = regexp.MustCompile(`^[^:]{1,40}:\s*`)
+
+// Prefixes that mark genuinely different content, not another edition of the
+// same episode: a "Preview: X" on disk must never suppress the later full
+// "X".
+var nonEditionPrefixRe = regexp.MustCompile(`(?i)\b(preview|teaser|trailer|excerpt|clip|sneak)\b`)
+
+// stripTitlePrefix removes one leading "Label: " from a raw title, unless
+// stripping would leave nothing.
+func stripTitlePrefix(s string) string {
+	m := titlePrefixRe.FindString(s)
+	if m == "" {
+		return s
+	}
+	if stripped := s[len(m):]; stripped != "" {
+		return stripped
+	}
+	return s
+}
+
+// editionMarkerMismatch reports that exactly one of the two titles carries a
+// preview/teaser marker — "Preview: X" is different content from "X", even
+// though every overlap path (containment included) would otherwise pair
+// them.
+func editionMarkerMismatch(a, b string) bool {
+	return nonEditionPrefixRe.MatchString(a) != nonEditionPrefixRe.MatchString(b)
 }
 
 // longestCommonSubstringLen returns the length in runes of the longest common
@@ -121,26 +185,25 @@ func longestCommonSubstringLen(a, b string) int {
 	return best
 }
 
-// materialTitleOverlap reports whether two raw titles overlap enough to call
-// them the same episode. Digit sequences must match exactly (Part 1 vs Part 2
-// are different episodes). Then a truncation retitle is one normalized title
-// contained in the other; anything else — reorderings like "Ai Goes Parabolic
-// | Greg Brockman, Co-Founder OpenAI" vs "... | OpenAI Co-Founder Greg
-// Brockman" — must share most of its content words. Substring length is
-// deliberately NOT the criterion: series episodes share long title templates
-// ("The Rise and Fall of ...") while being different episodes.
-func materialTitleOverlap(a, b string) bool {
-	if digitSeq(a) != digitSeq(b) {
+// strictTitleEquivalent reports whether two raw titles are the same episode's
+// title under only cosmetic transformation: normalized equality, a long
+// containment (truncation or edition-suffix retitle), or equality once a
+// short "Label: " prefix is stripped from either side ("WS MoreOrLess:
+// Climate Change" vs "Climate Change"). Digit sequences of the full
+// normalized titles must match, so "Part 1: X" vs "Part 2: X" stays
+// distinct. This is the evidence bar for cross-date matching (rule 3a),
+// deliberately tighter than materialTitleOverlap: no word-set path.
+func strictTitleEquivalent(a, b string) bool {
+	if editionMarkerMismatch(a, b) {
 		return false
 	}
 	na, nb := normalizeTitleForOverlap(a), normalizeTitleForOverlap(b)
-	if na == "" || nb == "" {
+	if na == "" || nb == "" || digitSeq(na) != digitSeq(nb) {
 		return false
 	}
 	if na == nb {
 		return true
 	}
-
 	shorter, longer := na, nb
 	if len([]rune(nb)) < len([]rune(na)) {
 		shorter, longer = nb, na
@@ -148,7 +211,33 @@ func materialTitleOverlap(a, b string) bool {
 	if len([]rune(shorter)) >= retitleContainMinRunes && strings.Contains(longer, shorter) {
 		return true
 	}
+	nsa := normalizeTitleForOverlap(stripTitlePrefix(a))
+	nsb := normalizeTitleForOverlap(stripTitlePrefix(b))
+	if nsa == "" || nsb == "" {
+		return false
+	}
+	return nsa == nb || na == nsb || nsa == nsb
+}
 
+// materialTitleOverlap reports whether two raw titles overlap enough to call
+// them the same episode. Digit sequences must match exactly (Part 1 vs Part 2
+// are different episodes). Then a strict equivalence (equality, containment,
+// prefix-strip) decides; anything else — reorderings like "Ai Goes Parabolic
+// | Greg Brockman, Co-Founder OpenAI" vs "... | OpenAI Co-Founder Greg
+// Brockman" — must share most of its content words. Substring length is
+// deliberately NOT the criterion: series episodes share long title templates
+// ("The Rise and Fall of ...") while being different episodes.
+func materialTitleOverlap(a, b string) bool {
+	if editionMarkerMismatch(a, b) {
+		return false
+	}
+	if strictTitleEquivalent(a, b) {
+		return true
+	}
+	na, nb := normalizeTitleForOverlap(a), normalizeTitleForOverlap(b)
+	if na == "" || nb == "" || digitSeq(na) != digitSeq(nb) {
+		return false
+	}
 	wa, wb := contentWordSet(na), contentWordSet(nb)
 	inter := 0
 	for w := range wa {
@@ -176,6 +265,11 @@ func publishedDate10(s string) string {
 		return s[:10]
 	}
 	return s
+}
+
+func parseDate10(s string) (time.Time, bool) {
+	t, err := time.Parse("2006-01-02", publishedDate10(s))
+	return t, err == nil
 }
 
 // newerCandidate reports whether a is the fresher row: later last_seen, then
@@ -218,6 +312,9 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 	// "Free Thinking" and 1,486 episodes re-hashed as new under the new
 	// podcast title, invisible to every same-podcast rule).
 	haveByGuid := make(map[string][]downloadCandidate)
+	// Same-podcast index of already-downloaded rows, any date, for the
+	// near-date re-issue rule (3a).
+	haveByPod := make(map[string][]downloadCandidate)
 	// Same-podcast index by exact raw title, any date, for repeats whose
 	// guid AND published date both changed (see rule 3b).
 	haveByPodTitle := make(map[string][]downloadCandidate)
@@ -227,6 +324,7 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 	for _, c := range cands {
 		if c.have {
 			haveByPodDate[dateKey(c)] = append(haveByPodDate[dateKey(c)], c)
+			haveByPod[c.podcastTitle] = append(haveByPod[c.podcastTitle], c)
 			haveByPodTitle[titleKey(c)] = append(haveByPodTitle[titleKey(c)], c)
 			if c.guid != "" {
 				haveByGuid[c.guid] = append(haveByGuid[c.guid], c)
@@ -330,6 +428,51 @@ func planDownloadSkips(cands []downloadCandidate) map[string]downloadSkip {
 				reason:       "retitle: same date and overlapping title as downloaded episode " + matches[0].episodeHash,
 			}
 			continue
+		}
+
+		// Rule 3a: a downloaded same-podcast episode published within a few
+		// days whose title is strictly equivalent — a re-issue of an episode
+		// held under another edition's title and date (2026-07-20: BBC served
+		// Radio 4-titled More or Less episodes whose World Service editions,
+		// dated 1-8 days later, were already on disk; rule 3 needs an exact
+		// date match and rule 3b an exact raw title, so all of them slipped
+		// through). Across dates the word-set path would let a daily feed's
+		// recurring topic titles collide, so only strictTitleEquivalent
+		// counts. Prefer the nearest date.
+		if cd, ok := parseDate10(c.published); ok {
+			var nearSib *downloadCandidate
+			nearDelta := 0
+			for i := range haveByPod[c.podcastTitle] {
+				sib := haveByPod[c.podcastTitle][i]
+				if sib.episodeHash == c.episodeHash {
+					continue
+				}
+				sd, ok := parseDate10(sib.published)
+				if !ok {
+					continue
+				}
+				delta := int(cd.Sub(sd).Hours() / 24)
+				if delta < 0 {
+					delta = -delta
+				}
+				if delta > nearDateSkipWindowDays || !strictTitleEquivalent(c.title, sib.title) {
+					continue
+				}
+				if nearSib == nil || delta < nearDelta ||
+					(delta == nearDelta && sib.episodeHash < nearSib.episodeHash) {
+					nearSib = &haveByPod[c.podcastTitle][i]
+					nearDelta = delta
+				}
+			}
+			if nearSib != nil {
+				skips[c.episodeHash] = downloadSkip{
+					matchedHash:  nearSib.episodeHash,
+					matchedTitle: nearSib.title,
+					reason: fmt.Sprintf("retitle: published %dd apart with equivalent title to downloaded episode %s",
+						nearDelta, nearSib.episodeHash),
+				}
+				continue
+			}
 		}
 
 		// Rule 3b: an already-downloaded same-podcast episode with the

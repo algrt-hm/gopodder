@@ -1,5 +1,44 @@
 # Bugs found
 
+## Cross-edition re-issues re-downloaded (2026-07-20)
+
+The BBC re-served a batch of 2015–2025 More or Less episodes in the feed with
+Radio 4-style titles, fresh guids, and the Radio 4 broadcast dates. Nine were
+downloaded as "fresh"; seven of those were episodes already on disk as the
+World Service editions ("WS MoreOrLess: Climate Change", "WS More or Less:
+Diet Coke Habit; 'Contained' Wildfires", …) published 1–8 days after the
+Radio 4 date. The retitle gate caught the four re-issues whose date matched
+exactly, but:
+
+- rule 3 (same date + overlapping title) can't see a date shifted by even a
+  day;
+- rule 3b (identical raw title, any date) can't see the "WS …:" prefix or
+  even a case-only change ("Should We Have…" vs "Should we have…");
+- "Part One" vs "Part 1" tripped the digit-sequence guard;
+- "Climate Change" (14 runes, 2 content words) is below both the containment
+  and word-set thresholds even against its exact WS twin.
+
+Only the pangolins (2020-06-13) and Hong Kong Covid (2022-03-27) episodes
+were genuinely new — both filled real gaps in the weekly sequence.
+
+Fixes, all in `skip.go`:
+
+- Rule 3a: a downloaded same-podcast sibling published within ±10 days whose
+  title is *strictly* equivalent — normalized equality, long containment, or
+  equality after stripping a short "Label: " prefix — skips. Deliberately
+  tighter than the same-date rule: across dates the word-set path would let
+  a daily feed's recurring topic titles collide.
+- Spelled-out numbers normalize to digits, so "Part One" ≡ "Part 1" and
+  "Part One" vs "Part Two" now hits the digit guard.
+- Preview guard: a preview/teaser marker on exactly one side vetoes every
+  overlap path, so a downloaded "Preview: X" can never suppress the full
+  "X" (previously the containment path would have paired them).
+
+Verified by replaying the pre-run state against a copy of the live db
+(19,827 episodes, 44 pending): the near-date rule skips exactly the seven
+cross-edition duplicates, the four same-date skips still fire, and the two
+genuinely new episodes still download. No other pending row matches.
+
 ## Whole podcast re-downloaded after publisher rename (2026-07-09)
 
 The BBC renamed the show in feed `podcasts.files.bbci.co.uk/p02nrvk3.rss`
