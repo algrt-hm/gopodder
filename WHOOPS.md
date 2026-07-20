@@ -39,6 +39,13 @@ Verified by replaying the pre-run state against a copy of the live db
 cross-edition duplicates, the four same-date skips still fire, and the two
 genuinely new episodes still download. No other pending row matches.
 
+Cleanup: `cleanup_more_or_less_reissues.sh` (run on the gopodder host AFTER
+deploying the fix — it greps the binary for the rule-3a reason string and
+refuses to run otherwise) deletes the seven duplicate files and their
+downloads rows, keeping the episodes rows so rule 3a re-skips them on the
+next parse. It verifies the WS keepers via the db registry only and never
+touches /bronze (2026-07-18 zio_wait hang). Dry run by default.
+
 ## Whole podcast re-downloaded after publisher rename (2026-07-09)
 
 The BBC renamed the show in feed `podcasts.files.bbci.co.uk/p02nrvk3.rss`
