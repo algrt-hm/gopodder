@@ -434,7 +434,7 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 
 	// The ifnull takes first_seen if published is null
 	// this sensibly handles the case where the published tag is not provided in the feed
-	query := `SELECT podcast_title, IFNULL(published, first_seen), title, podcastname_episodename_hash, file_url_hash, file FROM episodes WHERE file != '' AND file IS NOT NULL;`
+	query := `SELECT podcast_title, IFNULL(published, first_seen), title, podcastname_episodename_hash, file_url_hash, file, IFNULL(guid, ''), IFNULL(first_seen, ''), IFNULL(last_seen, '') FROM episodes WHERE file != '' AND file IS NOT NULL;`
 
 	db, err := sql.Open(sqlite3, dbFileName)
 	checkErr(err)
@@ -465,6 +465,7 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 
 	type episodeRow struct {
 		podcastTitle, published, title, episodeHash, file string
+		guid, firstSeen, lastSeen                         string
 	}
 	episodeRows := make([]episodeRow, 0)
 	prefixOwners := make(map[string]map[string]bool)
@@ -472,11 +473,12 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 	for rows.Next() {
 		// Data from db
 		var podcastTitle, published, title, podcastNameEpisodenameHash, fileUrlHash, file string
-		err = rows.Scan(&podcastTitle, &published, &title, &podcastNameEpisodenameHash, &fileUrlHash, &file)
+		var guid, firstSeen, lastSeen string
+		err = rows.Scan(&podcastTitle, &published, &title, &podcastNameEpisodenameHash, &fileUrlHash, &file, &guid, &firstSeen, &lastSeen)
 		checkErr(err)
 		_ = fileUrlHash
 
-		episodeRows = append(episodeRows, episodeRow{podcastTitle, published, title, podcastNameEpisodenameHash, file})
+		episodeRows = append(episodeRows, episodeRow{podcastTitle, published, title, podcastNameEpisodenameHash, file, guid, firstSeen, lastSeen})
 
 		canonical := buildNonInteractiveFilename(podcastTitle, title, published, podcastNameEpisodenameHash)
 		if nmh, ok := nameMinusHash(canonical); ok {
@@ -487,7 +489,31 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 		}
 	}
 
+	// Retitle backstop: podcasts that republish an episode under a new title
+	// (The Knowledge Project, chronically) give it a new episode hash, so the
+	// prefix check above can't see the copy already on disk. The feed guid is
+	// stable across retitles, so a same-(podcast, guid) sibling that already
+	// has a file marks this row as a duplicate; a guarded same-date title
+	// overlap catches guid-rotating feeds. Decisions are recorded in the
+	// skipped_episodes table for auditing — see skip.go.
+	skipCands := make([]downloadCandidate, 0, len(episodeRows))
+	for _, row := range episodeRows {
+		skipCands = append(skipCands, downloadCandidate{
+			podcastTitle: row.podcastTitle,
+			published:    row.published,
+			title:        row.title,
+			episodeHash:  row.episodeHash,
+			guid:         row.guid,
+			firstSeen:    row.firstSeen,
+			lastSeen:     row.lastSeen,
+			have:         !hashes.Contains(row.episodeHash),
+		})
+	}
+	retitleSkips := planDownloadSkips(skipCands)
+	skipRecords := make([]skippedEpisodeRecord, 0)
+
 	twinsSkipped := 0
+	retitlesSkipped := 0
 	for _, row := range episodeRows {
 		// If file_url_hash in hashes ...
 		if hashes.Contains(row.episodeHash) {
@@ -497,6 +523,20 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 				twinsSkipped++
 				continue
 			}
+			if s, ok := retitleSkips[row.episodeHash]; ok {
+				log.Printf("skipping %s: %s (%q)", newFilename, s.reason, s.matchedTitle)
+				retitlesSkipped++
+				skipRecords = append(skipRecords, skippedEpisodeRecord{
+					episodeHash:  row.episodeHash,
+					podcastTitle: row.podcastTitle,
+					title:        row.title,
+					guid:         row.guid,
+					matchedHash:  s.matchedHash,
+					matchedTitle: s.matchedTitle,
+					reason:       s.reason,
+				})
+				continue
+			}
 			filenames = append(filenames, newFilename)
 			urls = append(urls, row.file)
 		}
@@ -504,6 +544,12 @@ func generateDownloadList(podcastsDir string, scanPaths []string) bool {
 
 	if twinsSkipped > 0 {
 		log.Printf("skipped %d episode(s) already present under another hash", twinsSkipped)
+	}
+	if retitlesSkipped > 0 {
+		log.Printf("skipped %d episode(s) as retitle duplicates (recorded in skipped_episodes)", retitlesSkipped)
+	}
+	if err := recordSkippedEpisodes(skipRecords); err != nil {
+		log.Printf("warning: could not record skipped episodes: %v", err)
 	}
 
 	// some output to keep user informed
@@ -748,6 +794,7 @@ func parseThem(conf_file_path string) {
 	checkErr(err)
 
 	type feedResult struct {
+		url      string
 		podcast  map[string]string
 		episodes []M
 		err      error
@@ -769,7 +816,7 @@ func parseThem(conf_file_path string) {
 			defer wg.Done()
 			for url := range jobs {
 				podcast, episodes, parseErr := parseFeed(url)
-				results <- feedResult{podcast, episodes, parseErr}
+				results <- feedResult{url, podcast, episodes, parseErr}
 			}
 		}()
 	}
@@ -802,7 +849,7 @@ func parseThem(conf_file_path string) {
 		// any error whose text didn't contain "http error", so one flaky feed
 		// killed the entire run.) Log it and move on; the next run retries it.
 		if r.err != nil {
-			log.Printf("Skipping feed: %s", r.err)
+			log.Printf("Skipping feed %s: %s", r.url, r.err)
 			continue
 		}
 		podEpisodesIntoDatabase(db, r.podcast, r.episodes)
@@ -1001,6 +1048,11 @@ Typical use:
 	                            a podcast RENAME (old vs new podcast title),
 	                            which the twin pass cannot see.
 	--dedup-retitles-delete     Apply it.
+	--dedup-guid                Dry run: plan merging duplicate copies of
+	                            EPISODES a feed retitled (same guid, new
+	                            episode hash), which changes the filename
+	                            prefix and so hides them from the twin pass.
+	--dedup-guid-delete         Apply it.
 
 Note:
 	Will look in %s for configuration file (set $GOPODCONF to change);
@@ -1035,6 +1087,8 @@ Note:
 	pruneStaleDeleteOpt := parser.Flag("", "prune-stale-episodes-delete", &argparse.Options{Required: false, Help: "Apply the --prune-stale-episodes plan (deletes episodes rows)"})
 	dedupRetitlesOpt := parser.Flag("", "dedup-retitles", &argparse.Options{Required: false, Help: "Dry run: plan merging duplicate copies split across a podcast rename (old vs new podcast title prefixes)"})
 	dedupRetitlesDeleteOpt := parser.Flag("", "dedup-retitles-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-retitles plan"})
+	dedupGuidOpt := parser.Flag("", "dedup-guid", &argparse.Options{Required: false, Help: "Dry run: plan merging duplicate copies of episodes a feed retitled (same guid, different episode hash)"})
+	dedupGuidDeleteOpt := parser.Flag("", "dedup-guid-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-guid plan"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -1117,6 +1171,10 @@ Note:
 	}
 	if *dedupRetitlesOpt || *dedupRetitlesDeleteOpt {
 		checkErr(runDedupRetitles(scanPaths, *dedupRetitlesDeleteOpt))
+		return
+	}
+	if *dedupGuidOpt || *dedupGuidDeleteOpt {
+		checkErr(runDedupGuid(scanPaths, *dedupGuidDeleteOpt))
 		return
 	}
 
