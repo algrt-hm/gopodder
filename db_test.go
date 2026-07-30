@@ -371,3 +371,94 @@ func TestEpisodeRepeatNewGuidNewDateRefreshedByTitle(t *testing.T) {
 		t.Fatalf("repeat did not keep the original row identity: n=%d err=%v", n, err)
 	}
 }
+
+// Feed URLs are recorded on the podcasts row, kept when a re-parse carries no
+// URL, preserved through a rename, and queryable via podcastTitlesByURL
+func TestPodcastFeedURLRecorded(t *testing.T) {
+	useTempWorkingDir(t)
+	createTablesIfNotExist()
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	pod, episodes := renameTestFeed("Arts & Ideas", 5)
+	pod[feedURL] = "https://example.com/feed.rss"
+	podEpisodesIntoDatabase(db, pod, episodes)
+
+	var gotURL string
+	if err := db.QueryRow(`SELECT url FROM podcasts WHERE title = 'Arts & Ideas';`).Scan(&gotURL); err != nil {
+		t.Fatalf("query url: %v", err)
+	}
+	if gotURL != "https://example.com/feed.rss" {
+		t.Fatalf("url = %q, want the feed URL", gotURL)
+	}
+
+	// A re-parse without a feed URL must not clobber the recorded one
+	pod2, episodes := renameTestFeed("Arts & Ideas", 5)
+	podEpisodesIntoDatabase(db, pod2, episodes)
+	if err := db.QueryRow(`SELECT url FROM podcasts WHERE title = 'Arts & Ideas';`).Scan(&gotURL); err != nil || gotURL != "https://example.com/feed.rss" {
+		t.Fatalf("url after url-less re-parse = %q err=%v, want unchanged", gotURL, err)
+	}
+
+	// The URL survives a rename (same feed URL, new title)
+	newPod, episodes := renameTestFeed("Free Thinking", 5)
+	newPod[feedURL] = "https://example.com/feed.rss"
+	podEpisodesIntoDatabase(db, newPod, episodes)
+	if err := db.QueryRow(`SELECT url FROM podcasts WHERE title = 'Free Thinking';`).Scan(&gotURL); err != nil || gotURL != "https://example.com/feed.rss" {
+		t.Fatalf("url after rename = %q err=%v, want unchanged", gotURL, err)
+	}
+
+	m := podcastTitlesByURL()
+	if len(m) != 1 || m["https://example.com/feed.rss"] != "Free Thinking" {
+		t.Fatalf("podcastTitlesByURL = %#v, want feed URL -> Free Thinking", m)
+	}
+}
+
+// Dbs created before podcasts.url existed gain the column via the migration
+// in createTablesIfNotExist, with existing rows intact
+func TestPodcastsURLColumnMigration(t *testing.T) {
+	useTempWorkingDir(t)
+
+	db, err := sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE podcasts (
+			title TEXT PRIMARY KEY,
+			author TEXT,
+			description TEXT,
+			language TEXT,
+			link TEXT,
+			category TEXT,
+			first_seen TEXT NOT NULL,
+			last_seen TEXT NOT NULL
+		);`)
+	if err != nil {
+		t.Fatalf("create old-schema podcasts: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO podcasts (title, first_seen, last_seen) VALUES ('Old Pod', ?, ?);`, ts, ts)
+	if err != nil {
+		t.Fatalf("insert old row: %v", err)
+	}
+	db.Close()
+
+	createTablesIfNotExist()
+
+	db, err = sql.Open(sqlite3, dbFileName)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db.Close()
+
+	var gotURL sql.NullString
+	if err := db.QueryRow(`SELECT url FROM podcasts WHERE title = 'Old Pod';`).Scan(&gotURL); err != nil {
+		t.Fatalf("url column missing after migration: %v", err)
+	}
+	if gotURL.Valid {
+		t.Fatalf("expected NULL url on migrated row, got %q", gotURL.String)
+	}
+}

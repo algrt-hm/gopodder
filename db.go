@@ -69,7 +69,8 @@ func createTablesIfNotExist() {
 		link TEXT,
 		category TEXT,
 		first_seen TEXT NOT NULL,
-		last_seen TEXT NOT NULL
+		last_seen TEXT NOT NULL,
+		url TEXT -- feed URL from the config file, backfilled on each parse
 	);
 	`
 
@@ -255,6 +256,14 @@ func createTablesIfNotExist() {
 		checkErr(err)
 		_, err = db.Exec(`DELETE FROM interactive_episodes WHERE podcast_title IS NULL OR TRIM(podcast_title) = '';`)
 		checkErr(err)
+
+		// Migration: dbs created before 2026-07-30 lack podcasts.url
+		var hasURLCol int
+		checkErr(db.QueryRow(`SELECT count(*) FROM pragma_table_info('podcasts') WHERE name = 'url';`).Scan(&hasURLCol))
+		if hasURLCol == 0 {
+			_, err = db.Exec(`ALTER TABLE podcasts ADD COLUMN url TEXT;`)
+			checkErr(err)
+		}
 	}
 }
 
@@ -343,7 +352,7 @@ func renamePodcastInPlace(tx *sql.Tx, oldTitle string, pod map[string]string) {
 	_, err := tx.Exec(`
 		UPDATE podcasts
 		SET title = ?, author = ?, category = ?, description = ?,
-			language = ?, link = ?, last_seen = ?
+			language = ?, link = ?, last_seen = ?, url = COALESCE(?, url)
 		WHERE title = ?
 		;`,
 		nullWrap(pod[title]),
@@ -353,6 +362,7 @@ func renamePodcastInPlace(tx *sql.Tx, oldTitle string, pod map[string]string) {
 		nullWrap(pod[language_]),
 		nullWrap(pod[link]),
 		ts,
+		nullWrap(pod[feedURL]),
 		oldTitle,
 	)
 	checkErr(err)
@@ -360,6 +370,27 @@ func renamePodcastInPlace(tx *sql.Tx, oldTitle string, pod map[string]string) {
 	checkErr(err)
 	_, err = tx.Exec(`UPDATE interactive_episodes SET podcast_title = ? WHERE podcast_title = ?;`, pod[title], oldTitle)
 	checkErr(err)
+}
+
+// podcastTitlesByURL returns feed URL → podcast title for every podcasts row
+// with a url recorded (backfilled on each parse run since 2026-07-30)
+func podcastTitlesByURL() map[string]string {
+	db, err := sql.Open(sqlite3, dbFileName)
+	checkErr(err)
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT url, title FROM podcasts WHERE url IS NOT NULL AND title IS NOT NULL;`)
+	checkErr(err)
+	defer rows.Close()
+
+	m := make(map[string]string)
+	for rows.Next() {
+		var url, t string
+		checkErr(rows.Scan(&url, &t))
+		m[url] = t
+	}
+	checkErr(rows.Err())
+	return m
 }
 
 // findTitleSibling returns the episode hash of an existing same-podcast row
@@ -463,11 +494,13 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 			log.Println(pod[title], "is already in the db")
 		}
 
+		// COALESCE keeps any previously recorded feed URL when this parse
+		// didn't come with one (e.g. rows written by tests or older runs)
 		res, err := tx.Exec(`
 			UPDATE podcasts
-			SET last_seen = ?
+			SET last_seen = ?, url = COALESCE(?, url)
 			WHERE title = ?
-			;`, ts, pod[title])
+			;`, ts, nullWrap(pod[feedURL]), pod[title])
 		checkErr(err)
 
 		affected, err := res.RowsAffected()
@@ -499,9 +532,9 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 		// We wrap these because we don't want empty strings in the db ideally
 		res, err := tx.Exec(`
 			INSERT INTO podcasts
-			(author, category, description, language, link, title, first_seen, last_seen)
+			(author, category, description, language, link, title, first_seen, last_seen, url)
 			VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?)
+			(?, ?, ?, ?, ?, ?, ?, ?, ?)
 			;`,
 			nullWrap(pod[author]),
 			nullWrap(pod[category]),
@@ -511,6 +544,7 @@ func podEpisodesIntoDatabase(db *sql.DB, pod map[string]string, episodes []M) {
 			nullWrap(pod[title]),
 			ts,
 			ts,
+			nullWrap(pod[feedURL]),
 		)
 		checkErr(err)
 

@@ -908,3 +908,74 @@ func TestSameDayDigitCollidingEpisodesStillDownloaded(t *testing.T) {
 		t.Fatalf("expected Part 2 (present on disk) to be excluded, got %q", text)
 	}
 }
+
+// TestReadConfigIgnoresComments checks that lines starting with # are
+// treated as comments even when they contain a URL
+func TestReadConfigIgnoresComments(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gopodder.conf")
+	content := "https://example.com/a.rss\n" +
+		"# https://example.com/commented.rss\n" +
+		"   # indented comment https://example.com/x.rss\n" +
+		"https://example.com/b.rss\n"
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	urls, err := readConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://example.com/a.rss", "https://example.com/b.rss"}
+	if len(urls) != len(want) || urls[0] != want[0] || urls[1] != want[1] {
+		t.Fatalf("got %#v, want %#v", urls, want)
+	}
+}
+
+// TestAnnotateConfLines checks comment insertion, that existing comments are
+// preserved untouched, and that URLs without a title are left alone
+func TestAnnotateConfLines(t *testing.T) {
+	lines := []string{
+		"https://example.com/a.rss", // no comment above: insert
+		"# my note about B",         // unrelated comment: keep, insert below
+		"https://example.com/b.rss", //
+		"# Podcast C",               // already annotated: no duplicate
+		"https://example.com/c.rss", //
+		"",                          //
+		"https://example.com/d.rss", // no title known: leave alone
+		"",                          //
+	}
+	titles := map[string]string{
+		"https://example.com/a.rss": "Podcast A",
+		"https://example.com/b.rss": "Podcast B",
+		"https://example.com/c.rss": "Podcast C",
+	}
+
+	got := annotateConfLines(lines, titles)
+	want := []string{
+		"# Podcast A",
+		"https://example.com/a.rss",
+		"# my note about B",
+		"# Podcast B",
+		"https://example.com/b.rss",
+		"# Podcast C",
+		"https://example.com/c.rss",
+		"",
+		"https://example.com/d.rss",
+		"",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines %#v, want %d lines %#v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("line %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Running again with the same titles must be a no-op (idempotent)
+	again := annotateConfLines(got, titles)
+	if strings.Join(again, "\n") != strings.Join(got, "\n") {
+		t.Fatalf("not idempotent: got %#v", again)
+	}
+}

@@ -38,6 +38,7 @@ const description = "description"
 const language_ = "language"
 const link = "link"
 const title = "title"
+const feedURL = "feed_url"
 const episode = "episode"
 const file = "file"
 const format = "format"
@@ -80,6 +81,8 @@ func readConfig(confFilePath string) ([]string, error) {
 
 		https://example.com/podcasts/all_pods.rss
 		https://poddist.com/789759379342749/podcasts.rss
+
+		Lines starting with # are treated as comments and ignored
 	*/
 
 	content, err := os.ReadFile(confFilePath)
@@ -95,9 +98,10 @@ func readConfig(confFilePath string) ([]string, error) {
 
 	s := strings.Split(string(content), "\n")
 
-	// Want to look through the slices and only keep those that have http in them
+	// Want to look through the slices and only keep those that have http in them,
+	// ignoring comment lines starting with #
 	for i := range s {
-		if strings.Contains(s[i], "http") {
+		if confURLLine(s[i]) {
 			validated = append(validated, s[i])
 		}
 	}
@@ -108,6 +112,149 @@ func readConfig(confFilePath string) ([]string, error) {
 	log.Printf("%d valid URLs\n", len(validated))
 
 	return validated, nil
+}
+
+// confCommentLine reports whether a config file line is a comment
+func confCommentLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "#")
+}
+
+// confURLLine reports whether a config file line is a feed URL, using the
+// same test as readConfig
+func confURLLine(line string) bool {
+	return !confCommentLine(line) && strings.Contains(line, "http")
+}
+
+// annotateConfLines rebuilds config file lines so that each URL with an entry
+// in titles has a "# <title>" comment directly above it. Existing lines are
+// never modified or removed: the title comment is inserted between any
+// existing comment and the URL, and skipped if it is already the line
+// directly above. URLs not in titles, and all other lines, are preserved
+// verbatim.
+func annotateConfLines(lines []string, titles map[string]string) []string {
+	out := make([]string, 0, len(lines)+len(titles))
+	for _, line := range lines {
+		if confURLLine(line) {
+			if t, ok := titles[strings.TrimSpace(line)]; ok {
+				comment := "# " + t
+				if n := len(out); n == 0 || strings.TrimSpace(out[n-1]) != comment {
+					out = append(out, comment)
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// annotateConf rewrites the config file so each feed URL has a comment line
+// directly above it with the podcast's title, e.g.:
+//
+//	# In Our Time
+//	https://podcasts.files.bbci.co.uk/b006qykl.rss
+//
+// Titles are resolved from the db where possible (podcasts.url is backfilled
+// on each parse run); only URLs the db doesn't know are fetched, with a
+// bounded worker pool as in parseThem. URLs whose title can't be resolved are
+// left untouched.
+func annotateConf(confFileDir string) {
+	confPath := confFileDir + "/" + confFile
+	content, err := os.ReadFile(confPath)
+	checkErr(err)
+
+	lines := strings.Split(string(content), "\n")
+
+	var urls []string
+	for _, line := range lines {
+		if confURLLine(line) {
+			urls = append(urls, strings.TrimSpace(line))
+		}
+	}
+
+	if len(urls) == 0 {
+		log.Println("No feed URLs found in " + confPath)
+		return
+	}
+
+	titles := podcastTitlesByURL()
+	var toFetch []string
+	for _, url := range urls {
+		if _, ok := titles[url]; !ok {
+			toFetch = append(toFetch, url)
+		}
+	}
+	log.Printf("%d of %d feed URL(s) known to the db; fetching %d", len(urls)-len(toFetch), len(urls), len(toFetch))
+
+	if len(toFetch) > 0 {
+		type titleResult struct {
+			url   string
+			title string
+			err   error
+		}
+
+		jobs := make(chan string)
+		results := make(chan titleResult)
+
+		workers := feedParseWorkers
+		if len(toFetch) < workers {
+			workers = len(toFetch)
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for url := range jobs {
+					podcast, _, parseErr := parseFeed(url)
+					if parseErr != nil {
+						results <- titleResult{url, "", parseErr}
+						continue
+					}
+					results <- titleResult{url, podcast[title], nil}
+				}
+			}()
+		}
+
+		go func() {
+			for _, url := range toFetch {
+				jobs <- url
+			}
+			close(jobs)
+			wg.Wait()
+			close(results)
+		}()
+
+		for r := range results {
+			if r.err != nil {
+				log.Printf("Not annotating %s: %s", r.url, r.err)
+				continue
+			}
+			if r.title == "" {
+				log.Printf("Not annotating %s: feed has no title", r.url)
+				continue
+			}
+			titles[r.url] = r.title
+		}
+	}
+
+	out := annotateConfLines(lines, titles)
+
+	// Write to a temp file alongside and rename, so a failure mid-write
+	// can't truncate the config
+	tmpPath := confPath + ".tmp"
+	checkErr(os.WriteFile(tmpPath, []byte(strings.Join(out, "\n")), 0644))
+	checkErr(os.Rename(tmpPath, confPath))
+
+	// titles may hold db entries for URLs not in the config file, so count
+	// the config file's URLs that resolved
+	annotated := 0
+	for _, url := range urls {
+		if _, ok := titles[url]; ok {
+			annotated++
+		}
+	}
+	log.Printf("Annotated %d of %d feed URL(s) in %s", annotated, len(urls), confPath)
 }
 
 // hashFromFilename returns the hash and transformed title parts from the filename.
@@ -852,6 +999,8 @@ func parseThem(conf_file_path string) {
 			log.Printf("Skipping feed %s: %s", r.url, r.err)
 			continue
 		}
+		// Record which config file URL produced this podcast (podcasts.url)
+		r.podcast[feedURL] = r.url
 		podEpisodesIntoDatabase(db, r.podcast, r.episodes)
 	}
 }
@@ -1022,6 +1171,10 @@ Typical use:
 	Utility:
 	-l will list the (up to) 100 latest podcasts from the db
 	-i will launch interactive mode
+	--annotate-conf will insert a "# <podcast title>" comment above each URL
+	                in the config file (titles come from the db where known,
+	                otherwise the feed is fetched; existing comments are
+	                never modified)
 
 	Archiving (off-load older pods to another volume):
 	--register-archive <dir>    Mark files in <dir> as archived; -s will not
@@ -1089,6 +1242,7 @@ Note:
 	dedupRetitlesDeleteOpt := parser.Flag("", "dedup-retitles-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-retitles plan"})
 	dedupGuidOpt := parser.Flag("", "dedup-guid", &argparse.Options{Required: false, Help: "Dry run: plan merging duplicate copies of episodes a feed retitled (same guid, different episode hash)"})
 	dedupGuidDeleteOpt := parser.Flag("", "dedup-guid-delete", &argparse.Options{Required: false, Help: "Apply the --dedup-guid plan"})
+	annotateConfOpt := parser.Flag("", "annotate-conf", &argparse.Options{Required: false, Help: "Insert or update a comment line above each URL in the config file with the podcast's title"})
 
 	// Parser for shell args
 	err := parser.Parse(os.Args)
@@ -1175,6 +1329,10 @@ Note:
 	}
 	if *dedupGuidOpt || *dedupGuidDeleteOpt {
 		checkErr(runDedupGuid(scanPaths, *dedupGuidDeleteOpt))
+		return
+	}
+	if *annotateConfOpt {
+		annotateConf(confFilePath)
 		return
 	}
 

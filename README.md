@@ -87,8 +87,13 @@ GOPODCONF=`pwd` GOPODDIR=`pwd` ./gopodder -a >> pods.log 2>&1
 3. Thirdly you will need a configuration file, `gopodder.conf`, which is a list of RSS feeds to read from, e.g.
 
 ``` none
+# Lex Fridman Podcast
 https://lexfridman.com/feed/podcast/
 ```
+
+Lines starting with `#` are comments and are ignored, so feeds can be commented out or annotated.
+
+`gopodder --annotate-conf` will insert a `# <podcast title>` comment above each URL in the file for you. Titles are resolved from the database where the feed has already been parsed (`podcasts.url`), and fetched from the feed otherwise. The rewrite is non-destructive: existing comment lines are never modified or removed, and re-running is a no-op once every URL is annotated. Like the archive commands, it is a one-shot command (run-and-exit).
 
 ### Interactive mode
 
@@ -184,6 +189,7 @@ Database Design (SQLite)
 Six tables: `podcasts`, `episodes`, `interactive_episodes`, `downloads`, `archived_episodes`, and `skipped_episodes`.
 
 - `podcasts` uses `title` as the primary key. A feed renaming the whole show is detected at parse time (a majority of the feed's episode guids already belonging to one existing podcast) and applied as an in-place rename of the `podcasts` row and `episodes.podcast_title` — not a new record
+    - `podcasts.url` records which config file feed URL produced the row (added 2026-07-30, backfilled on every parse; older dbs gain the column via an automatic migration). It is metadata, not an identity: rows for feeds no longer in the config file keep a NULL url. Used by `--annotate-conf` and useful for tracing episodes back to their feed
 - `episodes` and `interactive_episodes` are keyed on an MD5 hash of `podcast_title` + `episode_title`
     - The `interactive_episodes` table duplicates the `episodes` schema — this redundancy exists to separate batch vs. TUI concerns
     - A feed retitling an episode is matched back to its existing row at parse time by `guid` (corroborated by published date or title overlap) or by exact title; only an uncorroborated retitle creates a new row, which the download-time guard then refuses (see "Retitled episodes and deduplication" above)
