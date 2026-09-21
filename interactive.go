@@ -1215,7 +1215,7 @@ func downloadEpisodeCmd(folder, podTitle string, item episodeItem, index int, ou
 			err = os.Chmod(filename, 0666)
 		}
 		if err == nil {
-			tagSinglePod(filename, item.title, podTitle, pythonPath, eyeD3Dir)
+			err = tagSinglePod(filename, item.title, podTitle, pythonPath, eyeD3Dir)
 		}
 		if err == nil {
 			if dbErr := recordInteractiveDownload(filename); dbErr != nil {

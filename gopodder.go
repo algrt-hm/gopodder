@@ -780,8 +780,10 @@ func runDownloadScript(podcasts_dir string) {
 	checkErr(err)
 }
 
-// tagSinglePod tags the file at filename with the title and album metadata
-func tagSinglePod(filename string, title string, album string, pythonPath string, eyeD3Dir string) {
+// tagSinglePod tags the file at filename with the title and album metadata.
+// It returns an error rather than panicking so that one awkward file does not
+// bring down a whole batch of tagging
+func tagSinglePod(filename string, title string, album string, pythonPath string, eyeD3Dir string) error {
 
 	// title tag is title
 	// album is podcast title
@@ -797,7 +799,10 @@ func tagSinglePod(filename string, title string, album string, pythonPath string
 		stripTagsWithEyeD3(filename, pythonPath, eyeD3Dir)
 		parse = false
 		tag, err = id3v2.Open(filename, id3v2.Options{Parse: parse})
-		checkErr(err)
+		if err != nil {
+			return fmt.Errorf("could not open %s to tag it: %w", filename, err)
+		}
+		defer tag.Close()
 	} else {
 		defer tag.Close()
 	}
@@ -837,9 +842,10 @@ func tagSinglePod(filename string, title string, album string, pythonPath string
 	err = tag.Save()
 
 	if err != nil {
-		fmt.Println("Title:", asciiTitle, "Album:", asciiAlbum, "Genre:", asciiGenre)
+		return fmt.Errorf("could not write tags to %s (title %q, album %q, genre %q): %w", filename, asciiTitle, asciiAlbum, asciiGenre, err)
 	}
-	checkErr(err)
+
+	return nil
 }
 
 // tagThosePods tag all the podcasts
@@ -884,8 +890,12 @@ func tagThosePods(podcasts_dir string, pythonPath string, eyeD3Dir string) int {
 		title := ns_title.String
 		log.Printf("%s: %s / %s", filename, podcast_title, title)
 
-		// Tag 'em
-		tagSinglePod(filename, title, podcast_title, pythonPath, eyeD3Dir)
+		// Tag 'em; if one file can't be tagged, log it and carry on with the
+		// rest. tagged_at is left null so it'll be retried next time around
+		if err := tagSinglePod(filename, title, podcast_title, pythonPath, eyeD3Dir); err != nil {
+			log.Printf("Skipping %s: %s", filename, err)
+			continue
+		}
 		count += 1
 		// Set of filenames we need to update in the db
 		filenames_set.Add(ns_filename)

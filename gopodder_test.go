@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	mapset "github.com/deckarep/golang-set"
+	"golang.org/x/text/encoding/charmap"
 )
 
 // TestCheckDependencies tests checkDependencies
@@ -41,6 +43,42 @@ func TestCleanText(t *testing.T) {
 
 	if got != want {
 		t.Errorf("got %q, wanted %q", got, want)
+	}
+
+	// Thin spaces (U+2009), as the FT uses around an ellipsis, are not in
+	// ISO-8859-1 and used to make tag.Save() blow up with
+	// "encoding: rune not supported by encoding"
+	s = "Mohammed:\u2009prophet, trader\u2009.\u2009.\u2009.\u2009and capitalist?"
+	want = "Mohammed: prophet, trader . . . and capitalist?"
+	got = cleanText(s, len(s))
+
+	if got != want {
+		t.Errorf("got %q, wanted %q", got, want)
+	}
+}
+
+// TestCleanTextIsEncodable checks cleanText only ever returns text that can be
+// written into an ISO-8859-1 (id3v2.3) text frame, whatever we throw at it
+func TestCleanTextIsEncodable(t *testing.T) {
+	cases := []string{
+		"Mohammed:\u2009prophet, trader\u2009.\u2009.\u2009.\u2009and capitalist?",
+		"\u4e2d\u6587 podcast episode about \u65e5\u672c\u8a9e",
+		"Money Clinic \u2014 the \u20bd rouble, the \u20a9 won and the \u20b9 rupee",
+		"A very long title with a multi-byte rune \u5b57 right on the truncation boundary",
+	}
+
+	for _, s := range cases {
+		for _, maxLength := range []int{len(s), 20, 41} {
+			got := cleanText(s, maxLength)
+
+			if !utf8.ValidString(got) {
+				t.Errorf("cleanText(%q, %d) returned invalid UTF-8: %q", s, maxLength, got)
+			}
+
+			if _, err := charmap.ISO8859_1.NewEncoder().String(got); err != nil {
+				t.Errorf("cleanText(%q, %d) = %q which is not ISO-8859-1 encodable: %s", s, maxLength, got, err)
+			}
+		}
 	}
 }
 

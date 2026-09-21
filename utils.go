@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/forPelevin/gomoji"
 	"golang.org/x/text/cases"
@@ -259,13 +260,51 @@ func cleanText(text string, maxLength int) string {
 	}
 	text = newText
 
+	// Remove any emojis (this is my own addition to the gist mentioned at the top in the comment),
+	// then get rid of any accents, and finally drop anything still left outside
+	// ISO-8859-1 which the charMap above does not know about
+	text = toLatin1(removeAccents(gomoji.RemoveEmojis(text)))
+
 	if len(text) > maxLength {
-		return text[0:maxLength-3] + "..."
+		return truncateBytes(text, maxLength-3) + "..."
 	}
 
-	// Remove any emojis (this is my own addition to the gist mentioned at the top in the comment)
-	// and then get rid of any accents finally
-	return removeAccents(gomoji.RemoveEmojis(text))
+	return text
+}
+
+// toLatin1 replaces any rune outside the ISO-8859-1 (Latin-1) repertoire:
+// whitespace variants (e.g. the U+2009 thin spaces the FT puts around an
+// ellipsis) become a plain space and anything else is dropped.
+// We need this because id3v2.3 text frames are written as ISO-8859-1 and the
+// encoder returns an error, rather than a substitute character, for any rune it
+// cannot represent
+func toLatin1(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r < 0x100:
+			b.WriteRune(r)
+		case unicode.IsSpace(r):
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+// truncateBytes truncates s to at most n bytes without cutting a rune in half,
+// as slicing a string mid-rune leaves invalid UTF-8 behind
+func truncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // isUpper is a utility function to check if a string is all upper-case
