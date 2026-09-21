@@ -903,9 +903,7 @@ func tagThosePods(podcasts_dir string, pythonPath string, eyeD3Dir string) int {
 
 	log.Printf("Been through tagging on %d files", count)
 
-	if count == 0 {
-		fmt.Println("Did you run -u after downloading with -d ?")
-	} else {
+	if count > 0 {
 		// Timestamp the tagged_at column in the download table
 		for _, ind_filename := range filenames_set.ToSlice() {
 			stmt, err := db.Prepare(`
@@ -1365,9 +1363,13 @@ Note:
 		hasDownloads := generateDownloadList(podcastsDir, scanPaths)
 		if hasDownloads {
 			runDownloadScript(podcastsDir)
-			updateDatabaseForDownloads()
-			tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
 		}
+		// Reconcile and tag on every run, not just runs that downloaded
+		// something: a batch interrupted part-way through tagging would
+		// otherwise sit untagged until a new episode happened along. Both are
+		// no-ops when there's nothing outstanding
+		updateDatabaseForDownloads()
+		tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
 	} else {
 		if *parseOptPtr {
 			parseThem(confFilePath)
@@ -1386,7 +1388,10 @@ Note:
 		}
 
 		if *tagPods {
-			tagThosePods(podcastsDir, pythonPath, eyeD3Dir)
+			// Nothing to tag having been asked to tag is usually a missing -u
+			if tagThosePods(podcastsDir, pythonPath, eyeD3Dir) == 0 {
+				fmt.Println("Did you run -u after downloading with -d ?")
+			}
 		}
 
 		if *listLatestPods {
